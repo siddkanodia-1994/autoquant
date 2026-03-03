@@ -1,0 +1,4 @@
+-- Migration 001: Initial schema
+-- This is a symlink/copy of step1/001_ddl_full_schema.sql
+-- Run via: python -m src.utils.migrate
+-- See /step1/001_ddl_full_schema.sql for the full DDL
