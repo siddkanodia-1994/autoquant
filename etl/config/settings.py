@@ -9,9 +9,13 @@ from typing import Optional
 
 
 class DatabaseSettings(BaseSettings):
-    """PostgreSQL connection settings (Supabase pooler + direct)."""
-    url: str = Field(..., alias="DATABASE_URL")
-    url_direct: str = Field("", alias="DATABASE_URL_DIRECT")
+    """PostgreSQL connection settings — uses individual params to avoid
+    URL-parsing issues with special characters in passwords."""
+    host: str = Field("db.jqxsgnvdnfyyeenqyqzs.supabase.co", alias="DB_HOST")
+    port: int = Field(5432, alias="DB_PORT")
+    user: str = Field("postgres.jqxsgnvdnfyyeenqyqzs", alias="DB_USER")
+    password: str = Field("", alias="DB_PASSWORD")
+    name: str = Field("postgres", alias="DB_NAME")
     schema_name: str = Field("autoquant", alias="DB_SCHEMA")
     pool_min_size: int = 2
     pool_max_size: int = 10
