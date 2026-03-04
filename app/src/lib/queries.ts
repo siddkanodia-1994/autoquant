@@ -1,0 +1,565 @@
+/**
+ * AutoQuant — Database Query Functions.
+ *
+ * All dashboard data fetching goes through these functions.
+ * They query the materialized view and fact tables via Supabase.
+ */
+
+import { supabase } from "./supabase";
+import type {
+  IndustryPulseData,
+  SegmentShare,
+  DailyDataPoint,
+  OEMDeepDiveData,
+  OEM,
+  ScorecardRow,
+  RevenueEstimate,
+  HistoricalData,
+  HistoricalYearSummary,
+  HistoricalMonthPoint,
+} from "./types";
+
+// ── Industry Pulse Queries ──
+
+export async function fetchIndustryPulse(): Promise<IndustryPulseData> {
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+
+  // Latest date with data
+  const { data: latestRow } = await supabase
+    .from("fact_daily_registrations")
+    .select("data_date")
+    .order("data_date", { ascending: false })
+    .limit(1)
+    .single();
+
+  const latestDate = latestRow?.data_date || now.toISOString().split("T")[0];
+
+  // MTD totals by segment from materialized view
+  const { data: mtdData } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select("segment_code, total_registrations")
+    .eq("calendar_year", currentYear)
+    .eq("calendar_month", currentMonth);
+
+  const segmentTotals: Record<string, number> = { PV: 0, CV: 0, "2W": 0 };
+  let mtdTotal = 0;
+
+  (mtdData || []).forEach((row: any) => {
+    const seg = row.segment_code;
+    const vol = Number(row.total_registrations) || 0;
+    if (seg in segmentTotals) {
+      segmentTotals[seg] += vol;
+      mtdTotal += vol;
+    }
+  });
+
+  // Segment breakdown for donut
+  const segmentBreakdown: SegmentShare[] = Object.entries(segmentTotals).map(
+    ([segment, value]) => ({
+      segment,
+      value,
+      percentage: mtdTotal > 0 ? (value / mtdTotal) * 100 : 0,
+    })
+  );
+
+  // Daily series (last 60 days) from fact table
+  const sixtyDaysAgo = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000)
+    .toISOString()
+    .split("T")[0];
+
+  const { data: dailyRaw } = await supabase.rpc("get_daily_series", {
+    start_date: sixtyDaysAgo,
+  });
+
+  // Build daily series with 7-day MA
+  const dailySeries: DailyDataPoint[] = buildDailySeries(dailyRaw || []);
+
+  // YoY calculations need prior year data
+  const priorYear = currentYear - 1;
+  const { data: priorMtd } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select("total_registrations")
+    .eq("calendar_year", priorYear)
+    .eq("calendar_month", currentMonth);
+
+  const priorMtdTotal = (priorMtd || []).reduce(
+    (sum: number, r: any) => sum + (Number(r.total_registrations) || 0),
+    0
+  );
+  const mtdYoY = priorMtdTotal > 0 ? ((mtdTotal - priorMtdTotal) / priorMtdTotal) * 100 : 0;
+
+  return {
+    latestDate,
+    latestDayTotal: dailySeries.length > 0 ? dailySeries[dailySeries.length - 1].total : 0,
+    mtdTotal,
+    qtdTotal: mtdTotal, // Simplified — full QTD needs quarter aggregation
+    ytdTotal: mtdTotal, // Simplified — full YTD needs year aggregation
+    mtdYoY,
+    qtdYoY: mtdYoY, // Placeholder
+    ytdYoY: mtdYoY, // Placeholder
+    segmentBreakdown,
+    dailySeries,
+    evPenetration: [],
+    fuelMixTrend: [],
+    dataFreshness: latestDate,
+  };
+}
+
+function buildDailySeries(raw: any[]): DailyDataPoint[] {
+  // Group by date
+  const byDate: Record<string, { pv: number; cv: number; tw: number }> = {};
+
+  for (const row of raw) {
+    const d = row.data_date;
+    if (!byDate[d]) byDate[d] = { pv: 0, cv: 0, tw: 0 };
+    const seg = row.segment_code;
+    const vol = Number(row.registrations) || 0;
+    if (seg === "PV") byDate[d].pv += vol;
+    else if (seg === "CV") byDate[d].cv += vol;
+    else if (seg === "2W") byDate[d].tw += vol;
+  }
+
+  const sorted = Object.entries(byDate)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, vals]) => ({
+      date,
+      ...vals,
+      total: vals.pv + vals.cv + vals.tw,
+      ma7: 0,
+    }));
+
+  // Compute 7-day moving average
+  for (let i = 0; i < sorted.length; i++) {
+    const window = sorted.slice(Math.max(0, i - 6), i + 1);
+    sorted[i].ma7 = Math.round(
+      window.reduce((s, r) => s + r.total, 0) / window.length
+    );
+  }
+
+  return sorted;
+}
+
+// ── OEM Deep Dive Queries ──
+
+export async function fetchOEMList(): Promise<OEM[]> {
+  const { data } = await supabase
+    .from("dim_oem")
+    .select("*")
+    .eq("is_listed", true)
+    .eq("is_in_scope", true)
+    .order("oem_name");
+
+  return (data || []) as OEM[];
+}
+
+export async function fetchOEMDeepDive(
+  ticker: string
+): Promise<OEMDeepDiveData | null> {
+  // Get OEM details
+  const { data: oem } = await supabase
+    .from("dim_oem")
+    .select("*")
+    .eq("nse_ticker", ticker)
+    .single();
+
+  if (!oem) return null;
+
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+
+  // MTD volume
+  const { data: mtdRows } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select("total_registrations, powertrain, segment_code")
+    .eq("nse_ticker", ticker)
+    .eq("calendar_year", currentYear)
+    .eq("calendar_month", currentMonth);
+
+  const mtdVolume = (mtdRows || []).reduce(
+    (sum: number, r: any) => sum + (Number(r.total_registrations) || 0),
+    0
+  );
+
+  // Monthly ICE vs EV split (last 12 months)
+  const { data: monthlyData } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select("calendar_year, calendar_month, powertrain, total_registrations")
+    .eq("nse_ticker", ticker)
+    .gte("calendar_year", currentYear - 1)
+    .order("calendar_year")
+    .order("calendar_month");
+
+  const iceEvSplit = buildICEvsEV(monthlyData || []);
+
+  return {
+    oem: oem as OEM,
+    mtdVolume,
+    qtdVolume: mtdVolume,
+    ytdVolume: mtdVolume,
+    mtdYoY: 0,
+    qtdYoY: 0,
+    ytdYoY: 0,
+    mtdMoM: 0,
+    marketShareTrend: [],
+    iceEvSplit,
+    segmentBreakdown: [],
+  };
+}
+
+function buildICEvsEV(data: any[]): { month: string; ice: number; ev: number }[] {
+  const byMonth: Record<string, { ice: number; ev: number }> = {};
+
+  for (const row of data) {
+    const key = `${row.calendar_year}-${String(row.calendar_month).padStart(2, "0")}`;
+    if (!byMonth[key]) byMonth[key] = { ice: 0, ev: 0 };
+    const vol = Number(row.total_registrations) || 0;
+    if (row.powertrain === "EV") byMonth[key].ev += vol;
+    else byMonth[key].ice += vol;
+  }
+
+  return Object.entries(byMonth)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, vals]) => ({ month, ...vals }));
+}
+
+// ── Scorecard Query ──
+
+export async function fetchScorecard(): Promise<ScorecardRow[]> {
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+
+  const { data } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select("oem_name, nse_ticker, is_listed, segment_code, powertrain, total_registrations")
+    .eq("calendar_year", currentYear)
+    .eq("calendar_month", currentMonth)
+    .eq("is_listed", true);
+
+  // Aggregate by OEM
+  const byOEM: Record<string, ScorecardRow> = {};
+
+  for (const row of data || []) {
+    const key = row.nse_ticker || row.oem_name;
+    if (!byOEM[key]) {
+      byOEM[key] = {
+        oem_name: row.oem_name,
+        nse_ticker: row.nse_ticker || "",
+        segment: row.segment_code,
+        qtd_volume: 0,
+        yoy_pct: 0,
+        market_share_pct: 0,
+        ev_pct: 0,
+        est_rev_cr: null,
+        confidence: "MEDIUM",
+      };
+    }
+    byOEM[key].qtd_volume += Number(row.total_registrations) || 0;
+  }
+
+  return Object.values(byOEM).sort((a, b) => b.qtd_volume - a.qtd_volume);
+}
+
+// ── Revenue Estimator Queries ──
+
+/**
+ * Fetch demand-based revenue proxy estimates.
+ *
+ * Formula: est_domestic_rev_cr = registrations × segment_ASP / 1e7
+ * ASP assumptions from fact_asp_master.
+ *
+ * DISCLAIMER: This is NOT accounting revenue. It is a demand-based proxy
+ * using registrations × assumed ASPs.
+ */
+export async function fetchRevenueEstimates(): Promise<RevenueEstimate[]> {
+  const now = new Date();
+  const currentMonth = now.getMonth() + 1;
+  const currentYear = now.getFullYear();
+
+  // Determine current FY quarter
+  // Indian FY: Q1=Apr-Jun, Q2=Jul-Sep, Q3=Oct-Dec, Q4=Jan-Mar
+  const fyYear = currentMonth <= 3 ? currentYear - 1 : currentYear;
+  const fyQuarterNum =
+    currentMonth >= 4 && currentMonth <= 6
+      ? 1
+      : currentMonth >= 7 && currentMonth <= 9
+        ? 2
+        : currentMonth >= 10 && currentMonth <= 12
+          ? 3
+          : 4;
+  const fyQuarter = `FY${fyYear}-${(fyYear + 1) % 100}Q${fyQuarterNum}`;
+
+  // Get ASP assumptions
+  const { data: aspData } = await supabase
+    .from("fact_asp_master")
+    .select("*")
+    .eq("fy_year", `FY${fyYear}-${String((fyYear + 1) % 100).padStart(2, "0")}`);
+
+  const aspMap: Record<string, { asp_lakhs: number; low: number; high: number }> = {};
+  for (const row of aspData || []) {
+    const key = `${row.segment_code}_${row.powertrain}`;
+    aspMap[key] = {
+      asp_lakhs: Number(row.asp_inr_lakhs) || 0,
+      low: Number(row.asp_low_inr_lakhs) || 0,
+      high: Number(row.asp_high_inr_lakhs) || 0,
+    };
+  }
+
+  // Get current quarter OEM registrations by segment + powertrain
+  const quarterMonths = getQuarterMonths(fyQuarterNum);
+  const { data: regData } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select(
+      "oem_name, nse_ticker, is_listed, segment_code, powertrain, total_registrations, calendar_month"
+    )
+    .eq("calendar_year", currentYear)
+    .eq("is_listed", true)
+    .in("calendar_month", quarterMonths);
+
+  // Aggregate by OEM and compute revenue
+  const byOEM: Record<
+    string,
+    {
+      oem_name: string;
+      nse_ticker: string;
+      reg_volume: number;
+      rev_cr: number;
+      rev_low_cr: number;
+      rev_high_cr: number;
+      months_with_data: Set<number>;
+    }
+  > = {};
+
+  for (const row of regData || []) {
+    const key = row.nse_ticker || row.oem_name;
+    if (!byOEM[key]) {
+      byOEM[key] = {
+        oem_name: row.oem_name,
+        nse_ticker: row.nse_ticker || "",
+        reg_volume: 0,
+        rev_cr: 0,
+        rev_low_cr: 0,
+        rev_high_cr: 0,
+        months_with_data: new Set(),
+      };
+    }
+
+    const vol = Number(row.total_registrations) || 0;
+    byOEM[key].reg_volume += vol;
+    byOEM[key].months_with_data.add(row.calendar_month);
+
+    // Compute revenue proxy using ASP
+    const aspKey = `${row.segment_code}_${row.powertrain}`;
+    const asp = aspMap[aspKey];
+    if (asp && asp.asp_lakhs > 0) {
+      // Revenue in Cr = volume × ASP_lakhs / 100
+      byOEM[key].rev_cr += (vol * asp.asp_lakhs) / 100;
+      byOEM[key].rev_low_cr += (vol * asp.low) / 100;
+      byOEM[key].rev_high_cr += (vol * asp.high) / 100;
+    }
+  }
+
+  const totalQuarterMonths = quarterMonths.length;
+
+  return Object.values(byOEM)
+    .map((oem) => ({
+      oem_name: oem.oem_name,
+      nse_ticker: oem.nse_ticker,
+      fy_quarter: fyQuarter,
+      reg_volume: oem.reg_volume,
+      est_domestic_rev_cr: Math.round(oem.rev_cr),
+      est_rev_low_cr: Math.round(oem.rev_low_cr),
+      est_rev_high_cr: Math.round(oem.rev_high_cr),
+      data_completeness_pct:
+        totalQuarterMonths > 0
+          ? Math.round((oem.months_with_data.size / totalQuarterMonths) * 100)
+          : 0,
+    }))
+    .sort((a, b) => b.est_domestic_rev_cr - a.est_domestic_rev_cr);
+}
+
+function getQuarterMonths(quarterNum: number): number[] {
+  switch (quarterNum) {
+    case 1:
+      return [4, 5, 6];
+    case 2:
+      return [7, 8, 9];
+    case 3:
+      return [10, 11, 12];
+    case 4:
+      return [1, 2, 3];
+    default:
+      return [1, 2, 3];
+  }
+}
+
+// ── Historical Data Queries ──
+
+/**
+ * Fetch historical data spanning 2016-present.
+ *
+ * Aggregates from mv_oem_monthly_summary to build:
+ *   - Year-level summaries with confidence indicators
+ *   - Monthly time series for trend charts
+ *   - Data coverage metrics
+ */
+export async function fetchHistoricalData(): Promise<HistoricalData> {
+  // Fetch all monthly data from MV
+  const { data: mvData } = await supabase
+    .from("mv_oem_monthly_summary")
+    .select(
+      "calendar_year, calendar_month, segment_code, powertrain, total_registrations, oem_id"
+    )
+    .gte("calendar_year", 2016)
+    .order("calendar_year")
+    .order("calendar_month");
+
+  const rows = mvData || [];
+
+  // ── Build year summaries ──
+  const yearMap: Record<
+    number,
+    {
+      total: number;
+      pv: number;
+      cv: number;
+      tw: number;
+      ev: number;
+      oems: Set<number>;
+      months: Set<number>;
+      sources: Set<string>;
+    }
+  > = {};
+
+  for (const row of rows) {
+    const yr = row.calendar_year;
+    if (!yearMap[yr]) {
+      yearMap[yr] = {
+        total: 0,
+        pv: 0,
+        cv: 0,
+        tw: 0,
+        ev: 0,
+        oems: new Set(),
+        months: new Set(),
+        sources: new Set(),
+      };
+    }
+    const vol = Number(row.total_registrations) || 0;
+    yearMap[yr].total += vol;
+    yearMap[yr].oems.add(row.oem_id);
+    yearMap[yr].months.add(row.calendar_month);
+
+    if (row.segment_code === "PV") yearMap[yr].pv += vol;
+    else if (row.segment_code === "CV") yearMap[yr].cv += vol;
+    else if (row.segment_code === "2W") yearMap[yr].tw += vol;
+
+    if (row.powertrain === "EV") yearMap[yr].ev += vol;
+  }
+
+  const sortedYears = Object.keys(yearMap)
+    .map(Number)
+    .sort();
+
+  const yearSummaries: HistoricalYearSummary[] = sortedYears.map(
+    (year, idx) => {
+      const y = yearMap[year];
+      const prevYear = idx > 0 ? yearMap[sortedYears[idx - 1]] : null;
+      const yoy =
+        prevYear && prevYear.total > 0
+          ? ((y.total - prevYear.total) / prevYear.total) * 100
+          : null;
+
+      // Confidence based on months of data and source
+      const monthsCovered = y.months.size;
+      let confidence: "HIGH" | "MEDIUM" | "LOW";
+      if (year >= 2025) confidence = "HIGH";     // Live VAHAN data
+      else if (monthsCovered >= 10) confidence = "MEDIUM"; // Historical with good coverage
+      else confidence = "LOW";                   // Sparse historical
+
+      // FY label: calendar year 2016 contributes to FY16 (Jan-Mar) and FY17 (Apr-Dec)
+      // Simplify: show the dominant FY
+      const fyYear = year + 1;
+      const fyLabel = `FY${fyYear % 100 === 0 ? "00" : String(fyYear % 100).padStart(2, "0")}`;
+
+      // Data source inference
+      let dataSource = "SIAM_HISTORICAL";
+      if (year >= 2025) dataSource = "VAHAN_DAILY";
+      else if (year >= 2024) dataSource = "VAHAN_DAILY + SIAM";
+
+      return {
+        year,
+        fy_label: fyLabel,
+        total_registrations: y.total,
+        pv_registrations: y.pv,
+        cv_registrations: y.cv,
+        tw_registrations: y.tw,
+        ev_registrations: y.ev,
+        ev_pct: y.total > 0 ? (y.ev / y.total) * 100 : 0,
+        yoy_pct: yoy !== null ? Math.round(yoy * 10) / 10 : null,
+        oems_with_data: y.oems.size,
+        data_source: dataSource,
+        confidence,
+        months_with_data: monthsCovered,
+      };
+    }
+  );
+
+  // ── Build monthly trend ──
+  const monthMap: Record<
+    string,
+    { pv: number; cv: number; tw: number; total: number; ev: number }
+  > = {};
+
+  for (const row of rows) {
+    const key = `${row.calendar_year}-${String(row.calendar_month).padStart(2, "0")}`;
+    if (!monthMap[key]) {
+      monthMap[key] = { pv: 0, cv: 0, tw: 0, total: 0, ev: 0 };
+    }
+    const vol = Number(row.total_registrations) || 0;
+    monthMap[key].total += vol;
+
+    if (row.segment_code === "PV") monthMap[key].pv += vol;
+    else if (row.segment_code === "CV") monthMap[key].cv += vol;
+    else if (row.segment_code === "2W") monthMap[key].tw += vol;
+
+    if (row.powertrain === "EV") monthMap[key].ev += vol;
+  }
+
+  const monthlyTrend: HistoricalMonthPoint[] = Object.entries(monthMap)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([month, vals]) => ({
+      month,
+      pv: vals.pv,
+      cv: vals.cv,
+      tw: vals.tw,
+      total: vals.total,
+      ev_total: vals.ev,
+      source: parseInt(month) >= 2025 ? "VAHAN" : "SIAM",
+    }));
+
+  // ── Coverage metrics ──
+  const allMonths = monthlyTrend.map((m) => m.month);
+  const minMonth = allMonths.length > 0 ? allMonths[0] : "";
+  const maxMonth = allMonths.length > 0 ? allMonths[allMonths.length - 1] : "";
+
+  // Expected months from Jan 2016 to now
+  const now = new Date();
+  const expectedMonths =
+    (now.getFullYear() - 2016) * 12 + now.getMonth() + 1;
+  const coveragePct =
+    expectedMonths > 0
+      ? Math.min(100, (allMonths.length / expectedMonths) * 100)
+      : 0;
+
+  return {
+    yearSummaries,
+    monthlyTrend,
+    dataRange: { min: minMonth, max: maxMonth },
+    totalRecords: rows.length,
+    coveragePct: Math.round(coveragePct * 10) / 10,
+  };
+}

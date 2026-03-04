@@ -1,0 +1,124 @@
+%%{ init: { 'theme': 'base', 'themeVariables': { 'primaryColor': '#1e293b', 'primaryTextColor': '#f8fafc', 'primaryBorderColor': '#3b82f6', 'lineColor': '#64748b', 'secondaryColor': '#0f172a', 'tertiaryColor': '#1e3a5f' } } }%%
+
+graph TB
+    subgraph SOURCES["DATA SOURCES"]
+        direction TB
+        VAHAN["VAHAN Dashboard<br/><i>vahan.parivahan.gov.in</i><br/>JSF / Headless Browser<br/>Daily Aggregated Counts"]
+        FADA["FADA Monthly PDFs<br/><i>fada.in</i><br/>Monthly Retail Press Releases"]
+        BSE["OEM BSE Filings<br/>Monthly Wholesale Volumes<br/>Quarterly Revenue"]
+        NAPIX["NAPIX API<br/><i>(Future - Official MoRTH)</i>"]:::future
+    end
+
+    subgraph ETL_SERVER["PYTHON ETL SERVER (Railway / Render)"]
+        direction TB
+        subgraph CONNECTORS["Connector / Adapter Layer"]
+            VC["VahanConnector<br/><i>Playwright</i>"]
+            FC["FadaConnector<br/><i>pdfplumber + tabula</i>"]
+            WC["WholesaleConnector<br/><i>BSE scraper</i>"]
+            NC["NapixConnector<br/><i>(Future)</i>"]:::future
+        end
+        subgraph PIPELINE["Transform Pipeline"]
+            VG["Validation Gate<br/>Row counts / Mapping / Anomalies"]
+            TR["Transform Engine<br/>Raw → Silver → Gold"]
+            DQ["Data Quality Framework<br/>Z-score / Reconciliation"]
+        end
+        subgraph SCHEDULING["Scheduling & Alerts"]
+            CRON["Cron Scheduler<br/>Daily 6AM / Weekly Sun 2AM<br/>Monthly 5th 10AM"]
+            TELEGRAM["Telegram Bot Alerts<br/>Failures / Unmapped / Anomalies"]
+        end
+    end
+
+    subgraph DATABASE["POSTGRESQL (Supabase)"]
+        direction TB
+        subgraph DIM["Dimension Tables"]
+            DD["dim_date<br/>dim_oem<br/>dim_oem_alias<br/>dim_segment"]
+            DF["dim_fuel<br/>dim_vehicle_class_map<br/>dim_geo"]
+        end
+        subgraph BRONZE["Bronze Layer (Raw)"]
+            RV["raw_vahan_snapshot"]
+            RF["raw_fada_monthly"]
+            RW["raw_oem_wholesale"]
+            RL["raw_extraction_log"]
+        end
+        subgraph SILVER["Silver Layer (Normalized)"]
+            FDR["fact_daily_registrations"]
+            FMR["fact_monthly_registrations"]
+            FMW["fact_monthly_wholesale"]
+        end
+        subgraph GOLD["Gold Layer (Analytics)"]
+            ASP["fact_asp_master"]
+            ERQ["est_quarterly_revenue"]
+            MV["mv_oem_monthly_summary<br/><i>(Materialized View)</i>"]
+        end
+    end
+
+    subgraph FRONTEND["NEXT.JS APP (Vercel)"]
+        direction TB
+        subgraph API["API Routes (Read-Only)"]
+            A1["/api/industry"]
+            A2["/api/oem/[ticker]"]
+            A3["/api/revenue"]
+            A4["/api/scorecard"]
+            A5["/api/history"]
+        end
+        subgraph PAGES["Dashboard Pages"]
+            P1["/dashboard<br/>Industry Pulse"]
+            P2["/oem/[ticker]<br/>OEM Deep Dive"]
+            P3["/revenue<br/>Revenue Estimator"]
+            P4["/scorecard<br/>Quarterly Scorecard"]
+            P5["/history<br/>Historical Explorer"]
+        end
+        ISR["ISR + SSR<br/>revalidate: 3600"]
+        UI["shadcn/ui + Recharts"]
+    end
+
+    %% Data flow connections
+    VAHAN -->|"Playwright<br/>3-5s delay"| VC
+    FADA -->|"PDF Download"| FC
+    BSE -->|"Monthly Filing"| WC
+    NAPIX -.->|"REST API<br/>(Future Swap)"| NC
+
+    VC --> VG
+    FC --> VG
+    WC --> VG
+    NC -.-> VG
+
+    VG -->|"PASS"| TR
+    VG -->|"FAIL"| TELEGRAM
+    TR --> DQ
+    DQ -->|"Load"| BRONZE
+    DQ -->|"Transform"| SILVER
+    DQ -->|"Aggregate"| GOLD
+    CRON --> VC
+    CRON --> FC
+    CRON --> WC
+
+    SILVER --> A1
+    SILVER --> A2
+    GOLD --> A3
+    GOLD --> A4
+    SILVER --> A5
+
+    A1 --> P1
+    A2 --> P2
+    A3 --> P3
+    A4 --> P4
+    A5 --> P5
+
+    ISR --> PAGES
+    UI --> PAGES
+
+    %% ETL triggers Vercel revalidation
+    TR -->|"ISR Revalidation<br/>Webhook"| ISR
+
+    %% Styling
+    classDef future stroke-dasharray: 5 5, stroke:#94a3b8, fill:#1e293b, color:#94a3b8
+    classDef sourceBox fill:#0d9488,stroke:#14b8a6,color:#f0fdfa
+    classDef etlBox fill:#7c3aed,stroke:#a78bfa,color:#f5f3ff
+    classDef dbBox fill:#2563eb,stroke:#60a5fa,color:#eff6ff
+    classDef feBox fill:#ea580c,stroke:#fb923c,color:#fff7ed
+
+    class VAHAN,FADA,BSE sourceBox
+    class VC,FC,WC,VG,TR,DQ,CRON,TELEGRAM etlBox
+    class DD,DF,RV,RF,RW,RL,FDR,FMR,FMW,ASP,ERQ,MV dbBox
+    class A1,A2,A3,A4,A5,P1,P2,P3,P4,P5,ISR,UI feBox
