@@ -1,0 +1,73 @@
+name: Daily VAHAN ETL
+
+on:
+  schedule:
+    # Run at 06:30 IST (01:00 UTC) every day — VAHAN updates around 04:00-06:00 IST
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "ETL command to run"
+        required: false
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - health
+          - gold-refresh
+
+concurrency:
+  group: etl-${{ github.event.inputs.command || 'daily' }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  etl:
+    name: VAHAN Daily Scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: etl/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          cd etl
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      - name: Run ETL
+        working-directory: etl
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_SCHEMA: autoquant
+          ENVIRONMENT: production
+          LOG_LEVEL: INFO
+          HEADLESS_BROWSER: "true"
+          REQUEST_DELAY_SECONDS: "4.0"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          VERCEL_REVALIDATION_URL: ${{ secrets.VERCEL_REVALIDATION_URL }}
+          VERCEL_REVALIDATION_SECRET: ${{ secrets.VERCEL_REVALIDATION_SECRET }}
+        run: |
+          python main.py ${{ github.event.inputs.command || 'daily' }}
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-logs-${{ github.run_id }}
+          path: etl/logs/
+          retention-days: 7
