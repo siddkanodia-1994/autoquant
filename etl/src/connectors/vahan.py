@@ -1,27 +1,21 @@
 """
-AutoQuant ETL — VAHAN Dashboard Connector.
+AutoQuant ETL — VAHAN Dashboard Connector (HTTP-based).
 
-Playwright-based extraction from the VAHAN 4.0 JSF dashboard.
-Targets ONLY publicly visible aggregated registration counts.
+Pure HTTP extraction from the VAHAN 4.0 JSF/PrimeFaces dashboard.
+Uses curl_cffi for TLS fingerprint impersonation + BeautifulSoup for parsing.
 
 The VAHAN dashboard at:
   https://vahan.parivahan.gov.in/vahan4dashboard/vahan/view/reportview.xhtml
 
-Uses JSF (PrimeFaces) with server-side rendering. Key characteristics:
-  - All interactions are AJAX POST requests with javax.faces.ViewState
-  - Dropdowns use PrimeFaces <p:selectOneMenu> which fire AJAX on change
-  - Data tables render as <table> with pagination
-  - Y-axis options: Maker, Vehicle Category, Vehicle Class, Fuel, Norms
-  - X-axis: Month-Wise, Calendar Year, Financial Year
-  - Filters: State, RTO, Vehicle Category, Vehicle Class, Fuel, Maker, Norms
+is a JSF (PrimeFaces) server-side app. All data interactions are
+standard form POSTs with javax.faces parameters — no browser needed.
 
 Extraction strategy:
-  1. Navigate to dashboard → wait for JSF ViewState
-  2. Set Y-axis = "Maker"
-  3. Set X-axis = "Month-Wise" (current month)
-  4. Iterate vehicle categories: set filter → extract table
-  5. For each table row: capture (maker, fuel, vehicle_class, count)
-  6. Rate-limit: configurable delay between interactions
+  1. GET the dashboard → capture JSESSIONID + ViewState + form fields
+  2. POST to set Y-axis = "Maker", X-axis = "Month Wise"
+  3. POST to set each vehicle class filter → extract table HTML
+  4. Parse table rows: (maker, fuel, vehicle_class, count)
+  5. Rate-limit: configurable delay between requests
 
 IMPORTANT CONSTRAINTS:
   - NO CAPTCHA bypass
@@ -34,17 +28,13 @@ IMPORTANT CONSTRAINTS:
 
 import asyncio
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urljoin
 
-from playwright.async_api import (
-    async_playwright,
-    Browser,
-    BrowserContext,
-    Page,
-    Playwright,
-    TimeoutError as PlaywrightTimeout,
-)
+from curl_cffi.requests import AsyncSession
+from bs4 import BeautifulSoup, Tag
 
 from config import get_settings
 from src.connectors.base import (
@@ -57,13 +47,16 @@ from src.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Vehicle categories to iterate (maps to VAHAN dropdown values)
-# We only extract PV, CV, 2W — others are excluded per scope
-VEHICLE_CATEGORIES = {
+# ── Constants ──
+
+VAHAN_URL = "https://vahan.parivahan.gov.in/vahan4dashboard/vahan/view/reportview.xhtml"
+
+# Vehicle classes grouped by segment (maps to VAHAN "VhClass" checkbox values)
+VEHICLE_CATEGORIES: dict[str, list[str]] = {
     "PV": [
         "Motor Car",
         "Motor Cab",
-        "Omnibus(P)",      # Private use omnibus
+        "Omnibus(P)",
     ],
     "CV": [
         "Goods Carrier",
@@ -78,19 +71,126 @@ VEHICLE_CATEGORIES = {
     ],
 }
 
-# Flattened list for extraction — we query each category separately
-ALL_VEHICLE_CLASSES_TO_EXTRACT = []
-for seg, classes in VEHICLE_CATEGORIES.items():
-    for cls in classes:
-        ALL_VEHICLE_CLASSES_TO_EXTRACT.append((seg, cls))
+ALL_VEHICLE_CLASSES = [
+    (seg, cls) for seg, classes in VEHICLE_CATEGORIES.items() for cls in classes
+]
+
+# Default headers to mimic a real browser session
+BROWSER_HEADERS = {
+    "Accept": "application/xml, text/xml, */*; q=0.01",
+    "Accept-Language": "en-IN,en-GB;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Origin": "https://vahan.parivahan.gov.in",
+    "Referer": VAHAN_URL,
+    "X-Requested-With": "XMLHttpRequest",
+    "Faces-Request": "partial/ajax",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+}
+
+
+def _extract_viewstate(html: str) -> Optional[str]:
+    """Extract javax.faces.ViewState from HTML form."""
+    soup = BeautifulSoup(html, "html.parser")
+    vs = soup.find("input", {"name": "javax.faces.ViewState"})
+    if vs and isinstance(vs, Tag):
+        return vs.get("value", "")
+    # Try regex fallback
+    match = re.search(
+        r'name="javax\.faces\.ViewState"\s+value="([^"]*)"', html
+    )
+    return match.group(1) if match else None
+
+
+def _extract_form_id(html: str) -> str:
+    """Extract the main JSF form ID."""
+    soup = BeautifulSoup(html, "html.parser")
+    form = soup.find("form", {"id": re.compile(r".*formlogin.*|.*Layout.*")})
+    if form and isinstance(form, Tag):
+        return form.get("id", "masterLayout_formlogin")
+    return "masterLayout_formlogin"
+
+
+def _extract_dropdown_options(html: str, select_id: str) -> list[str]:
+    """Extract option values from a PrimeFaces SelectOneMenu or <select>."""
+    soup = BeautifulSoup(html, "html.parser")
+    # Try hidden <select> element (PrimeFaces renders both a visible div and a hidden select)
+    select = soup.find("select", {"id": select_id})
+    if select and isinstance(select, Tag):
+        return [
+            opt.get("value", opt.text.strip())
+            for opt in select.find_all("option")
+            if opt.get("value") and opt.get("value") != ""
+        ]
+    # Try PrimeFaces panel items
+    items = soup.select(f"#{select_id}_panel .ui-selectonemenu-items li")
+    return [
+        li.get("data-label", li.text.strip())
+        for li in items
+        if li.get("data-label")
+    ]
+
+
+def _parse_data_table(html: str) -> list[dict[str, Any]]:
+    """
+    Parse PrimeFaces datatable HTML fragment into records.
+
+    The VAHAN table typically has columns like:
+      [S.No, Maker/OEM, <month columns>, Total]
+    or for Maker Y-axis with Month-Wise X-axis:
+      [S.No, Maker, Count]
+
+    We extract all rows and let the caller interpret the schema.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    records: list[dict[str, Any]] = []
+
+    # Find all datatable bodies
+    for tbody in soup.select(".ui-datatable tbody, table tbody"):
+        for tr in tbody.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if not cells or len(cells) < 2:
+                continue
+
+            # Skip headers / totals
+            first = cells[0].upper()
+            if first in ("", "TOTAL", "GRAND TOTAL", "S.NO", "SR.NO", "S.NO."):
+                continue
+            # Skip row if first cell is just a serial number
+            if first.isdigit() and len(cells) >= 3:
+                cells = cells[1:]  # Drop serial number column
+
+            maker = cells[0].strip()
+            if not maker:
+                continue
+
+            # Last cell is typically the count/total
+            count_str = cells[-1].replace(",", "").replace(" ", "").strip()
+            if not count_str.isdigit():
+                # Try second-to-last if last is empty
+                if len(cells) >= 3:
+                    count_str = cells[-2].replace(",", "").replace(" ", "").strip()
+                if not count_str.isdigit():
+                    continue
+
+            count = int(count_str)
+            if count == 0:
+                continue
+
+            records.append({
+                "maker": maker.upper(),
+                "registration_count": count,
+                "raw_cells": cells,
+            })
+
+    return records
 
 
 class VahanConnector(BaseConnector):
     """
-    Playwright-based connector for VAHAN 4.0 dashboard.
+    HTTP-based connector for VAHAN 4.0 dashboard.
 
-    Extracts aggregated registration counts by Maker × Fuel × Vehicle Class
-    for the specified period.
+    Uses curl_cffi to impersonate Chrome's TLS fingerprint, avoiding
+    any bot detection. All interactions are standard JSF form POSTs.
 
     Usage:
         async with VahanConnector() as connector:
@@ -101,320 +201,247 @@ class VahanConnector(BaseConnector):
 
     def __init__(self) -> None:
         self._settings = get_settings().scraping
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
+        self._session: Optional[AsyncSession] = None
+        self._viewstate: Optional[str] = None
+        self._form_id: str = "masterLayout_formlogin"
+        self._page_html: str = ""
 
     async def setup(self) -> None:
-        """Launch headless browser."""
-        logger.info("Launching Playwright browser (headless=%s)", self._settings.headless)
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=self._settings.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
+        """Create an HTTP session with Chrome TLS fingerprint."""
+        logger.info("Creating curl_cffi session (Chrome impersonation)")
+        self._session = AsyncSession(
+            impersonate="chrome120",
+            timeout=self._settings.page_timeout_ms / 1000,
+            verify=True,
         )
-        self._context = await self._browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="en-IN",
-            timezone_id="Asia/Kolkata",
-        )
-        self._page = await self._context.new_page()
-        self._page.set_default_timeout(self._settings.page_timeout_ms)
-        logger.info("Browser launched successfully")
 
     async def teardown(self) -> None:
-        """Close browser and playwright."""
-        if self._page:
-            await self._page.close()
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
-        logger.info("Browser closed")
+        """Close the HTTP session."""
+        if self._session:
+            await self._session.close()
+            self._session = None
+        logger.info("HTTP session closed")
 
     async def health_check(self) -> bool:
         """Check if VAHAN dashboard is reachable."""
         try:
-            page = self._page or await self._ensure_page()
-            response = await page.goto(
+            if not self._session:
+                await self.setup()
+            resp = await self._session.get(
                 self._settings.vahan_base_url,
-                wait_until="domcontentloaded",
-                timeout=30_000,
+                headers={"Accept": "text/html"},
+                timeout=15,
             )
-            if response and response.ok:
-                logger.info("VAHAN dashboard reachable (HTTP %d)", response.status)
-                return True
-            logger.warning("VAHAN dashboard returned HTTP %d", response.status if response else 0)
-            return False
+            ok = resp.status_code == 200
+            logger.info("VAHAN dashboard: HTTP %d (%s)", resp.status_code, "OK" if ok else "FAILED")
+            return ok
         except Exception as e:
             logger.error("VAHAN health check failed: %s", e)
             return False
 
-    async def _ensure_page(self) -> Page:
-        """Ensure we have a valid page instance."""
-        if self._page is None:
-            raise RuntimeError("Browser not initialized. Call setup() first.")
-        return self._page
-
     async def _delay(self, multiplier: float = 1.0) -> None:
         """Rate-limiting delay between requests."""
         delay = self._settings.request_delay_seconds * multiplier
-        logger.debug("Waiting %.1fs (rate limit)", delay)
+        logger.debug("Rate limit: waiting %.1fs", delay)
         await asyncio.sleep(delay)
 
-    async def _navigate_to_dashboard(self) -> None:
-        """Navigate to VAHAN dashboard and wait for it to load."""
-        page = await self._ensure_page()
-        logger.info("Navigating to VAHAN dashboard...")
-        await page.goto(
+    async def _load_dashboard(self) -> None:
+        """
+        GET the dashboard page to establish session + capture ViewState.
+        """
+        logger.info("Loading VAHAN dashboard...")
+        resp = await self._session.get(
             self._settings.vahan_base_url,
-            wait_until="networkidle",
-            timeout=self._settings.page_timeout_ms,
+            headers={"Accept": "text/html,application/xhtml+xml,*/*"},
         )
-        # Wait for the JSF form to render
-        await page.wait_for_selector("form", timeout=30_000)
+        resp.raise_for_status()
+        self._page_html = resp.text
+        self._viewstate = _extract_viewstate(self._page_html)
+        self._form_id = _extract_form_id(self._page_html)
+
+        if not self._viewstate:
+            raise RuntimeError("Failed to extract ViewState from VAHAN dashboard")
+
+        logger.info(
+            "Dashboard loaded: form=%s, viewstate=%s...",
+            self._form_id,
+            self._viewstate[:20] if self._viewstate else "NONE",
+        )
+
+    def _build_ajax_post(
+        self,
+        source: str,
+        execute: str = "@all",
+        render: str = "tablePnl",
+        extra_params: Optional[dict[str, str]] = None,
+    ) -> dict[str, str]:
+        """
+        Build a PrimeFaces AJAX partial-submit POST body.
+
+        Standard JSF AJAX parameters:
+          javax.faces.partial.ajax=true
+          javax.faces.source=<component_id>
+          javax.faces.partial.execute=<execute_list>
+          javax.faces.partial.render=<render_list>
+          javax.faces.ViewState=<token>
+          <form_id>=<form_id>
+        """
+        data = {
+            "javax.faces.partial.ajax": "true",
+            "javax.faces.source": source,
+            "javax.faces.partial.execute": execute,
+            "javax.faces.partial.render": render,
+            "javax.faces.ViewState": self._viewstate or "",
+            self._form_id: self._form_id,
+        }
+        if extra_params:
+            data.update(extra_params)
+        return data
+
+    async def _ajax_post(
+        self,
+        source: str,
+        execute: str = "@all",
+        render: str = "tablePnl",
+        extra_params: Optional[dict[str, str]] = None,
+    ) -> str:
+        """
+        Send a PrimeFaces AJAX POST and return the response XML/HTML.
+        Also updates ViewState from the response.
+        """
+        data = self._build_ajax_post(source, execute, render, extra_params)
+
+        resp = await self._session.post(
+            self._settings.vahan_base_url,
+            data=data,
+            headers=BROWSER_HEADERS,
+        )
+        resp.raise_for_status()
+        body = resp.text
+
+        # Update ViewState from AJAX response (PrimeFaces embeds it in XML)
+        new_vs = re.search(
+            r'<update\s+id="javax\.faces\.ViewState"[^>]*><!\[CDATA\[([^\]]*)\]\]>',
+            body,
+        )
+        if new_vs:
+            self._viewstate = new_vs.group(1)
+
+        return body
+
+    async def _set_dropdown(
+        self, field_id: str, value: str, label: str
+    ) -> str:
+        """
+        Set a PrimeFaces SelectOneMenu dropdown via AJAX POST.
+        Simulates the onChange event.
+        """
+        logger.info("Setting %s = '%s'", label, value)
+        body = await self._ajax_post(
+            source=field_id,
+            execute=field_id,
+            render="@all",  # Let server decide what to re-render
+            extra_params={
+                field_id: value,
+                f"{field_id}_focus": "",
+                f"{field_id}_input": value,
+            },
+        )
         await self._delay(0.5)
-        logger.info("Dashboard loaded")
+        return body
 
-    async def _select_dropdown(
-        self, page: Page, selector: str, value: str, label: str
-    ) -> bool:
+    async def _trigger_refresh(self) -> str:
         """
-        Select a value from a PrimeFaces dropdown.
-
-        JSF/PrimeFaces dropdowns render as:
-          <div class="ui-selectonemenu">
-            <div class="ui-selectonemenu-trigger">
-            <div class="ui-selectonemenu-panel">
-              <ul class="ui-selectonemenu-items">
-                <li data-label="..." class="ui-selectonemenu-item">...</li>
-
-        Strategy:
-          1. Click the trigger to open the panel
-          2. Wait for the panel to be visible
-          3. Click the item with matching label
-          4. Wait for AJAX response
+        Trigger the data table refresh (equivalent to rclay() JS function).
+        The refresh button source is 'irclay' and updates 'tablePnl'.
         """
-        try:
-            # Click dropdown trigger to open
-            trigger = page.locator(f"{selector} .ui-selectonemenu-trigger")
-            await trigger.click()
-            await asyncio.sleep(0.5)
+        logger.info("Triggering data refresh (irclay → tablePnl)...")
 
-            # Find and click the option
-            option = page.locator(
-                f"{selector} .ui-selectonemenu-items li[data-label='{value}']"
-            )
-            if await option.count() == 0:
-                # Try case-insensitive match
-                items = page.locator(f"{selector} .ui-selectonemenu-items li")
-                count = await items.count()
-                for i in range(count):
-                    item = items.nth(i)
-                    item_label = await item.get_attribute("data-label") or ""
-                    if item_label.strip().upper() == value.strip().upper():
-                        await item.click()
-                        logger.debug("Selected '%s' in %s (case-insensitive)", value, label)
-                        await self._wait_for_ajax(page)
-                        return True
-                logger.warning("Option '%s' not found in dropdown %s", value, label)
-                return False
+        # Build form data with all current selections
+        data = self._build_ajax_post(
+            source="irclay",
+            execute="@all",
+            render="tablePnl",
+            extra_params={
+                "yaxisVar": "Maker",
+                "xaxisVar": "Month Wise",
+                "irclay": "irclay",
+            },
+        )
 
-            await option.click()
-            logger.debug("Selected '%s' in %s", value, label)
-            await self._wait_for_ajax(page)
-            return True
+        resp = await self._session.post(
+            self._settings.vahan_base_url,
+            data=data,
+            headers=BROWSER_HEADERS,
+        )
+        resp.raise_for_status()
+        body = resp.text
 
-        except PlaywrightTimeout:
-            logger.error("Timeout selecting '%s' in %s", value, label)
-            return False
-        except Exception as e:
-            logger.error("Error selecting dropdown %s: %s", label, e)
-            return False
+        # Update ViewState
+        new_vs = re.search(
+            r'<update\s+id="javax\.faces\.ViewState"[^>]*><!\[CDATA\[([^\]]*)\]\]>',
+            body,
+        )
+        if new_vs:
+            self._viewstate = new_vs.group(1)
 
-    async def _wait_for_ajax(self, page: Page, timeout_ms: int = 15_000) -> None:
-        """Wait for PrimeFaces AJAX request to complete."""
-        try:
-            # PrimeFaces sets a status indicator during AJAX
-            await page.wait_for_function(
-                """() => {
-                    const ajaxStatus = document.querySelector('.ui-ajax-loader');
-                    return !ajaxStatus || ajaxStatus.style.display === 'none'
-                        || getComputedStyle(ajaxStatus).display === 'none';
-                }""",
-                timeout=timeout_ms,
-            )
-        except PlaywrightTimeout:
-            logger.warning("AJAX wait timed out — proceeding anyway")
-        await asyncio.sleep(0.3)  # Small buffer after AJAX
-
-    async def _extract_table_data(self, page: Page) -> list[dict[str, Any]]:
-        """
-        Extract data from the rendered PrimeFaces data table.
-
-        The VAHAN dashboard renders data in <table> elements.
-        We extract all visible rows including pagination.
-
-        Returns list of dicts with keys:
-          maker, fuel, vehicle_class, registration_count
-        """
-        records: list[dict[str, Any]] = []
-
-        try:
-            # Wait for table to render
-            await page.wait_for_selector(
-                "table.ui-datatable-tablewrapper table, .ui-datatable table",
-                timeout=15_000,
-            )
-
-            # Extract via JavaScript for reliability
-            table_data = await page.evaluate("""() => {
-                const rows = [];
-                // Find all data tables on the page
-                const tables = document.querySelectorAll('.ui-datatable tbody tr');
-                for (const row of tables) {
-                    const cells = row.querySelectorAll('td');
-                    if (cells.length >= 2) {
-                        const rowData = [];
-                        for (const cell of cells) {
-                            rowData.push(cell.textContent.trim());
-                        }
-                        rows.push(rowData);
-                    }
-                }
-                return rows;
-            }""")
-
-            for row_cells in table_data:
-                if len(row_cells) >= 2:
-                    # Table structure depends on Y-axis selection
-                    # When Y-axis = Maker: columns are [Maker, Count] or [Maker, Fuel, Count]
-                    record = self._parse_table_row(row_cells)
-                    if record:
-                        records.append(record)
-
-        except PlaywrightTimeout:
-            logger.warning("Table extraction timed out")
-        except Exception as e:
-            logger.error("Table extraction error: %s", e)
-
-        return records
-
-    def _parse_table_row(self, cells: list[str]) -> Optional[dict[str, Any]]:
-        """
-        Parse a table row into a structured record.
-
-        Handles variable column layouts depending on Y-axis / grouping.
-        """
-        try:
-            # Skip header/summary rows
-            if not cells or cells[0].upper() in ("TOTAL", "GRAND TOTAL", "S.NO", "SR.NO"):
-                return None
-
-            # Clean count value (remove commas, handle empty)
-            count_str = cells[-1].replace(",", "").replace(" ", "").strip()
-            if not count_str or not count_str.isdigit():
-                return None
-
-            count = int(count_str)
-            if count == 0:
-                return None
-
-            # The maker name is typically the first meaningful column
-            maker = cells[0].strip() if cells[0].strip() else None
-            if not maker:
-                return None
-
-            return {
-                "maker": maker.upper(),
-                "registration_count": count,
-                "raw_cells": cells,  # Preserve for debugging
-            }
-        except (ValueError, IndexError):
-            return None
-
-    async def _handle_pagination(self, page: Page) -> list[dict[str, Any]]:
-        """
-        Handle PrimeFaces datatable pagination.
-        Extracts data from all pages, not just the first.
-        """
-        all_records: list[dict[str, Any]] = []
-
-        # Get first page
-        records = await self._extract_table_data(page)
-        all_records.extend(records)
-
-        # Check for pagination
-        while True:
-            next_btn = page.locator(".ui-paginator-next:not(.ui-state-disabled)")
-            if await next_btn.count() == 0:
-                break
-
-            await next_btn.click()
-            await self._wait_for_ajax(page)
-            await self._delay(0.3)
-
-            records = await self._extract_table_data(page)
-            if not records:
-                break
-            all_records.extend(records)
-
-        return all_records
+        return body
 
     async def _extract_for_vehicle_class(
         self,
-        page: Page,
         vehicle_class: str,
         segment: str,
         period: str,
     ) -> list[dict[str, Any]]:
         """
-        Extract maker × count data for a specific vehicle class and period.
-
-        Steps:
-          1. Set vehicle class filter
-          2. Set Y-axis to "Maker"
-          3. Extract all rows (with pagination)
-          4. Tag each record with vehicle_class and segment
+        Set vehicle class filter and extract maker × count data.
         """
         logger.info(
             "Extracting: segment=%s, vehicle_class=%s, period=%s",
             segment, vehicle_class, period,
         )
 
-        # These selectors will need to be tuned against the live VAHAN DOM.
-        # They are configurable and modular per Risk #1 mitigation.
-        # The actual CSS selectors depend on the JSF component IDs which
-        # may change between VAHAN releases.
-        #
-        # TODO: Externalize selectors to config/vahan_selectors.yaml
-
-        # Select vehicle class in the filter dropdown
-        selected = await self._select_dropdown(
-            page,
-            "#vaborCatid",  # Placeholder — actual ID from VAHAN DOM inspection
-            vehicle_class,
-            "Vehicle Class",
+        # Build POST with vehicle class filter + Y=Maker + X=Month Wise + refresh
+        data = self._build_ajax_post(
+            source="irclay",
+            execute="@all",
+            render="tablePnl",
+            extra_params={
+                "yaxisVar": "Maker",
+                "xaxisVar": "Month Wise",
+                "VhClass": vehicle_class,
+                "irclay": "irclay",
+            },
         )
-        if not selected:
-            logger.warning("Could not select vehicle class '%s', skipping", vehicle_class)
-            return []
 
-        await self._delay()
+        resp = await self._session.post(
+            self._settings.vahan_base_url,
+            data=data,
+            headers=BROWSER_HEADERS,
+        )
+        resp.raise_for_status()
+        body = resp.text
 
-        # Extract table data (with pagination)
-        records = await self._handle_pagination(page)
+        # Update ViewState
+        new_vs = re.search(
+            r'<update\s+id="javax\.faces\.ViewState"[^>]*><!\[CDATA\[([^\]]*)\]\]>',
+            body,
+        )
+        if new_vs:
+            self._viewstate = new_vs.group(1)
+
+        # Parse table from the AJAX response
+        # PrimeFaces wraps updates in <changes><update id="tablePnl">...<![CDATA[...]]></update>
+        table_html = body
+        cdata_match = re.search(
+            r'<update\s+id="tablePnl"[^>]*><!\[CDATA\[(.*?)\]\]></update>',
+            body,
+            re.DOTALL,
+        )
+        if cdata_match:
+            table_html = cdata_match.group(1)
+
+        records = _parse_data_table(table_html)
 
         # Tag each record with metadata
         for record in records:
@@ -446,40 +473,34 @@ class VahanConnector(BaseConnector):
         """
         result = ExtractionResult(source=self.source, status=ExtractionStatus.SUCCESS)
         all_records: list[dict[str, Any]] = []
+        start_time = time.monotonic()
 
         try:
-            page = await self._ensure_page()
+            if not self._session:
+                await self.setup()
 
-            # Step 1: Navigate to dashboard
-            await self._navigate_to_dashboard()
-
-            # Step 2: Set X-axis to Month-Wise and select the target month
-            # The period selection depends on the VAHAN UI — typically a
-            # date range or month selector
-            await self._select_dropdown(
-                page, "#xaborId", "Month-Wise", "X-Axis"
-            )
+            # Step 1: Load dashboard (establishes session + ViewState)
+            await self._load_dashboard()
             await self._delay()
 
-            # Step 3: Set Y-axis to Maker
-            await self._select_dropdown(
-                page, "#yaborId", "Maker", "Y-Axis"
-            )
+            # Step 2: Set Y-axis to Maker
+            await self._set_dropdown("yaxisVar", "Maker", "Y-Axis")
             await self._delay()
 
-            # Step 4: Set state filter to "All India"
-            # (The default may already be All India)
+            # Step 3: Set X-axis to Month Wise
+            await self._set_dropdown("xaxisVar", "Month Wise", "X-Axis")
+            await self._delay()
 
-            # Step 5: Iterate over vehicle classes
-            target_classes = []
-            for seg, cls in ALL_VEHICLE_CLASSES_TO_EXTRACT:
-                if segments is None or seg in segments:
-                    target_classes.append((seg, cls))
+            # Step 4: Iterate over vehicle classes
+            target_classes = [
+                (seg, cls) for seg, cls in ALL_VEHICLE_CLASSES
+                if segments is None or seg in segments
+            ]
 
             for idx, (seg, vehicle_class) in enumerate(target_classes):
                 try:
                     records = await self._extract_for_vehicle_class(
-                        page, vehicle_class, seg, period
+                        vehicle_class, seg, period
                     )
                     all_records.extend(records)
                 except Exception as e:
@@ -493,6 +514,7 @@ class VahanConnector(BaseConnector):
                     await self._delay()
 
             result.records = all_records
+            duration = time.monotonic() - start_time
             result.mark_complete(
                 ExtractionStatus.SUCCESS if all_records else ExtractionStatus.PARTIAL
             )
@@ -502,12 +524,12 @@ class VahanConnector(BaseConnector):
                 "segments_requested": segments or ["PV", "CV", "2W"],
                 "vehicle_classes_attempted": len(target_classes),
                 "total_records": len(all_records),
+                "duration_seconds": round(duration, 1),
             }
 
             logger.info(
                 "VAHAN extraction complete: %d records in %.1fs",
-                len(all_records),
-                result.duration_seconds,
+                len(all_records), duration,
             )
 
         except Exception as e:
@@ -520,51 +542,76 @@ class VahanConnector(BaseConnector):
 
 class VahanSelectors:
     """
-    Configurable CSS/XPath selectors for VAHAN dashboard elements.
-    Isolated here so they can be updated when VAHAN UI changes (Risk #1).
+    Documented CSS selectors / JSF component IDs for VAHAN dashboard.
+    Validated against the live VAHAN DOM as of March 2026.
 
-    NOTE: These are PLACEHOLDER selectors. They must be validated against
-    the live VAHAN DOM by inspecting the page source. The actual PrimeFaces
-    component IDs are auto-generated and may change between releases.
-
-    To discover real selectors:
-      1. Open VAHAN dashboard in browser with DevTools
-      2. Inspect each dropdown/table element
-      3. Note the JSF client ID (e.g., 'j_idt31:j_idt33')
-      4. Update this class
+    Component IDs:
+      - Form:           masterLayout_formlogin
+      - Y-Axis:         yaxisVar
+      - X-Axis:         xaxisVar
+      - Type:           j_idt28
+      - State:          j_idt36
+      - RTO:            selectedRto
+      - Year Type:      selectedYearType
+      - Year:           selectedYear
+      - Vehicle Class:  VhClass  (checkbox)
+      - Fuel:           fuel     (checkbox)
+      - Norms:          norms    (checkbox)
+      - Refresh:        irclay   (button triggers rclay())
+      - Table panel:    tablePnl
+      - Combined table: combTablePnl
     """
 
+    # Form
+    FORM_ID = "masterLayout_formlogin"
+
     # Dropdowns
-    X_AXIS = "#xaborId"               # X-axis selector (Month-Wise / Calendar Year / FY)
-    Y_AXIS = "#yaborId"               # Y-axis selector (Maker / Vehicle Category / etc.)
-    STATE_FILTER = "#stateId"          # State filter dropdown
-    VEHICLE_CATEGORY = "#vaborCatid"   # Vehicle category (2W / Transport / Non-Transport)
-    VEHICLE_CLASS = "#vaborClsid"      # Vehicle class (Motor Car / Bus / etc.)
-    FUEL_FILTER = "#fuelId"            # Fuel type filter
-    MAKER_FILTER = "#makerId"          # Maker filter (usually set to "All")
+    Y_AXIS = "yaxisVar"
+    X_AXIS = "xaxisVar"
+    STATE_FILTER = "j_idt36"
+    YEAR_TYPE = "selectedYearType"
+    YEAR = "selectedYear"
+    RTO = "selectedRto"
+    TYPE = "j_idt28"
 
-    # Date/Period
-    FROM_DATE = "#fromDateId"          # From date input
-    TO_DATE = "#toDateId"              # To date input
+    # Checkboxes (multi-select)
+    VEHICLE_CLASS = "VhClass"
+    FUEL = "fuel"
+    NORMS = "norms"
 
-    # Action buttons
-    REFRESH_BTN = "#refreshBtnId"      # Refresh/Submit button
-    DOWNLOAD_BTN = "#downloadBtnId"    # Download/Export button (if available)
+    # Buttons
+    REFRESH = "irclay"
+    REFRESH_ALT = ["j_idt67", "j_idt74", "j_idt83"]
 
-    # Data table
-    DATA_TABLE = ".ui-datatable"
-    TABLE_ROWS = ".ui-datatable tbody tr"
-    TABLE_CELLS = "td"
-    PAGINATOR_NEXT = ".ui-paginator-next:not(.ui-state-disabled)"
-    PAGINATOR_INFO = ".ui-paginator-current"  # "Showing 1-50 of 200"
+    # Data panels
+    TABLE_PANEL = "tablePnl"
+    COMBINED_TABLE = "combTablePnl"
 
-    # AJAX status
-    AJAX_LOADER = ".ui-ajax-loader"
+    # Y-Axis option values
+    Y_AXIS_OPTIONS = [
+        "Vehicle Category",
+        "Vehicle Class",
+        "Norms",
+        "Fuel",
+        "Maker",
+        "State",
+    ]
+
+    # X-Axis option values
+    X_AXIS_OPTIONS = [
+        "Vehicle Category",
+        "Norms",
+        "Fuel",
+        "Vehicle Category Group",
+        "Financial Year",
+        "Calendar Year",
+        "Month Wise",
+    ]
 
     @classmethod
-    def to_dict(cls) -> dict[str, str]:
+    def to_dict(cls) -> dict[str, Any]:
         """Export all selectors as a dict for logging/debugging."""
         return {
             k: v for k, v in cls.__dict__.items()
-            if isinstance(v, str) and not k.startswith("_")
+            if not k.startswith("_") and not callable(v)
         }
