@@ -247,13 +247,13 @@ export default function FADAPage() {
                     width={130}
                   />
                   <Tooltip
-                    formatter={(value: number) => [
-                      value.toLocaleString("en-IN"),
+                    formatter={(value: any) => [
+                      Number(value).toLocaleString("en-IN"),
                       "Volume",
                     ]}
-                    labelFormatter={(label) => {
+                    labelFormatter={(label: any) => {
                       const item = chartData.find((d) => d.name === label);
-                      return item?.fullName || label;
+                      return item?.fullName || String(label);
                     }}
                     contentStyle={{
                       borderRadius: "8px",
