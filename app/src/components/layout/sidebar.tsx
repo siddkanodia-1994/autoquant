@@ -9,6 +9,7 @@ import {
   TrendingUp,
   Table2,
   Clock,
+  Car,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -23,6 +24,7 @@ const navItems: {
   { href: "/scorecard", label: "Scorecard", icon: Table2 },
   { href: "/revenue", label: "Revenue Proxy", icon: TrendingUp },
   { href: "/history", label: "Historical", icon: Clock },
+  { href: "/fada", label: "FADA Retail", icon: Car },
 ];
 
 export function Sidebar() {
@@ -81,7 +83,7 @@ export function Sidebar() {
       {/* Footer */}
       <div className="border-t border-zinc-100 px-5 py-3 dark:border-zinc-800">
         <p className="text-[10px] text-zinc-400">
-          Data: VAHAN (MoRTH) &bull; Updated daily
+          Data: VAHAN &bull; FADA &bull; Updated daily
         </p>
       </div>
     </aside>

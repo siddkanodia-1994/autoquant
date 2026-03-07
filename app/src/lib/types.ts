@@ -169,3 +169,25 @@ export interface RevenueEstimate {
   est_rev_high_cr: number;
   data_completeness_pct: number;
 }
+
+// ── FADA Retail Data Types ──
+export interface FADAOemRow {
+  oem_name: string;
+  volume: number;
+  market_share_pct: number;
+  yoy_pct: number | null;
+}
+
+export interface FADAMonthData {
+  report_period: string; // YYYY-MM
+  segment: string;       // 2W | CV | PV
+  oems: FADAOemRow[];
+  total_volume: number;
+}
+
+export interface FADADashboardData {
+  segments: string[];
+  availableMonths: string[];
+  latestMonth: string;
+  data: FADAMonthData[];
+}

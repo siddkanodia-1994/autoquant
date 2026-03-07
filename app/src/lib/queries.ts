@@ -17,6 +17,9 @@ import type {
   HistoricalData,
   HistoricalYearSummary,
   HistoricalMonthPoint,
+  FADADashboardData,
+  FADAMonthData,
+  FADAOemRow,
 } from "./types";
 
 // ── Industry Pulse Queries ──
@@ -561,5 +564,103 @@ export async function fetchHistoricalData(): Promise<HistoricalData> {
     dataRange: { min: minMonth, max: maxMonth },
     totalRecords: rows.length,
     coveragePct: Math.round(coveragePct * 10) / 10,
+  };
+}
+
+// ── FADA Retail Data Queries ──
+
+/**
+ * Fetch FADA monthly OEM retail data across all segments.
+ * Returns data grouped by report_period + segment with OEM-level detail,
+ * market share, and YoY growth.
+ */
+export async function fetchFADAData(): Promise<FADADashboardData> {
+  const { data: rawRows, error } = await supabase
+    .from("raw_fada_report")
+    .select("report_period, oem_name, segment, volume, yoy_pct")
+    .eq("data_type", "actual")
+    .order("report_period", { ascending: false })
+    .order("segment")
+    .order("volume", { ascending: false });
+
+  if (error) {
+    console.error("[FADA] Query error:", error);
+    throw new Error("Failed to fetch FADA data");
+  }
+
+  const rows = rawRows || [];
+
+  // Group by period + segment
+  const groupKey = (r: any) => `${r.report_period}__${r.segment}`;
+  const groups: Record<
+    string,
+    { period: string; segment: string; oems: FADAOemRow[]; total: number }
+  > = {};
+
+  for (const row of rows) {
+    const key = groupKey(row);
+    if (!groups[key]) {
+      groups[key] = {
+        period: row.report_period,
+        segment: row.segment,
+        oems: [],
+        total: 0,
+      };
+    }
+    const vol = Number(row.volume) || 0;
+    groups[key].total += vol;
+    groups[key].oems.push({
+      oem_name: row.oem_name,
+      volume: vol,
+      market_share_pct: 0, // computed below
+      yoy_pct: row.yoy_pct != null ? Number(row.yoy_pct) : null,
+    });
+  }
+
+  // Compute market share within each group
+  for (const g of Object.values(groups)) {
+    for (const oem of g.oems) {
+      oem.market_share_pct =
+        g.total > 0 ? Math.round((oem.volume / g.total) * 1000) / 10 : 0;
+    }
+  }
+
+  // Compute YoY where missing (compare same month prior year)
+  const periodSegmentVolume: Record<string, number> = {};
+  for (const g of Object.values(groups)) {
+    for (const oem of g.oems) {
+      periodSegmentVolume[`${g.period}__${g.segment}__${oem.oem_name}`] = oem.volume;
+    }
+  }
+  for (const g of Object.values(groups)) {
+    const [yearStr, monthStr] = g.period.split("-");
+    const priorPeriod = `${Number(yearStr) - 1}-${monthStr}`;
+    for (const oem of g.oems) {
+      if (oem.yoy_pct == null) {
+        const priorVol =
+          periodSegmentVolume[`${priorPeriod}__${g.segment}__${oem.oem_name}`];
+        if (priorVol != null && priorVol > 0) {
+          oem.yoy_pct =
+            Math.round(((oem.volume - priorVol) / priorVol) * 1000) / 10;
+        }
+      }
+    }
+  }
+
+  const data: FADAMonthData[] = Object.values(groups).map((g) => ({
+    report_period: g.period,
+    segment: g.segment,
+    oems: g.oems,
+    total_volume: g.total,
+  }));
+
+  const allPeriods = [...new Set(data.map((d) => d.report_period))].sort().reverse();
+  const allSegments = [...new Set(data.map((d) => d.segment))].sort();
+
+  return {
+    segments: allSegments,
+    availableMonths: allPeriods,
+    latestMonth: allPeriods[0] || "",
+    data,
   };
 }
