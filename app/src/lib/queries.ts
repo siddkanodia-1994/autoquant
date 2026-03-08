@@ -20,6 +20,8 @@ import type {
   FADADashboardData,
   FADAMonthData,
   FADAOemRow,
+  FADAFYData,
+  FADAFYOemRow,
 } from "./types";
 
 // ── Industry Pulse Queries ──
@@ -569,10 +571,30 @@ export async function fetchHistoricalData(): Promise<HistoricalData> {
 
 // ── FADA Retail Data Queries ──
 
+/** Non-OEM entries to filter out (fuel type aggregates / catch-all buckets) */
+const NON_OEM_NAMES = new Set([
+  "DIESEL", "EV", "PETROL/ETHANOL", "CNG/LPG", "HYBRID",
+  "METHANOL", "OTHERS", "OTHERS INCLUDING EV",
+]);
+
+/** Convert YYYY-MM period to Indian Financial Year label */
+function periodToFY(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  const fy = m >= 4 ? y + 1 : y;
+  return `FY${String(fy % 100).padStart(2, "0")}`;
+}
+
+/** Compute prior month period: "2025-04" → "2025-03", "2025-01" → "2024-12" */
+function priorMonth(period: string): string {
+  const [y, m] = period.split("-").map(Number);
+  if (m === 1) return `${y - 1}-12`;
+  return `${y}-${String(m - 1).padStart(2, "0")}`;
+}
+
 /**
  * Fetch FADA monthly OEM retail data across all segments.
- * Returns data grouped by report_period + segment with OEM-level detail,
- * market share, and YoY growth.
+ * Returns monthly + FY grouped data with OEM-level detail,
+ * market share, YoY growth, and MoM growth.
  */
 export async function fetchFADAData(): Promise<FADADashboardData> {
   const { data: rawRows, error } = await supabase
@@ -588,9 +610,11 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
     throw new Error("Failed to fetch FADA data");
   }
 
-  const rows = rawRows || [];
+  const rows = (rawRows || []).filter(
+    (r: any) => !NON_OEM_NAMES.has(r.oem_name)
+  );
 
-  // Group by period + segment
+  // ── Build monthly groups ──
   const groupKey = (r: any) => `${r.report_period}__${r.segment}`;
   const groups: Record<
     string,
@@ -600,67 +624,155 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
   for (const row of rows) {
     const key = groupKey(row);
     if (!groups[key]) {
-      groups[key] = {
-        period: row.report_period,
-        segment: row.segment,
-        oems: [],
-        total: 0,
-      };
+      groups[key] = { period: row.report_period, segment: row.segment, oems: [], total: 0 };
     }
     const vol = Number(row.volume) || 0;
     groups[key].total += vol;
     groups[key].oems.push({
       oem_name: row.oem_name,
       volume: vol,
-      market_share_pct: 0, // computed below
+      market_share_pct: 0,
       yoy_pct: row.yoy_pct != null ? Number(row.yoy_pct) : null,
+      mom_pct: null,
     });
   }
 
-  // Compute market share within each group
+  // Compute market share
   for (const g of Object.values(groups)) {
     for (const oem of g.oems) {
-      oem.market_share_pct =
-        g.total > 0 ? Math.round((oem.volume / g.total) * 1000) / 10 : 0;
+      oem.market_share_pct = g.total > 0 ? Math.round((oem.volume / g.total) * 1000) / 10 : 0;
     }
   }
 
-  // Compute YoY where missing (compare same month prior year)
-  const periodSegmentVolume: Record<string, number> = {};
+  // Build OEM volume lookup: period__segment__oem -> volume
+  const volLookup: Record<string, number> = {};
+  const totalLookup: Record<string, number> = {};
   for (const g of Object.values(groups)) {
+    totalLookup[`${g.period}__${g.segment}`] = g.total;
     for (const oem of g.oems) {
-      periodSegmentVolume[`${g.period}__${g.segment}__${oem.oem_name}`] = oem.volume;
+      volLookup[`${g.period}__${g.segment}__${oem.oem_name}`] = oem.volume;
     }
   }
+
+  // Compute YoY and MoM
   for (const g of Object.values(groups)) {
     const [yearStr, monthStr] = g.period.split("-");
-    const priorPeriod = `${Number(yearStr) - 1}-${monthStr}`;
+    const priorYearPeriod = `${Number(yearStr) - 1}-${monthStr}`;
+    const priorMo = priorMonth(g.period);
+
     for (const oem of g.oems) {
+      // YoY
       if (oem.yoy_pct == null) {
-        const priorVol =
-          periodSegmentVolume[`${priorPeriod}__${g.segment}__${oem.oem_name}`];
+        const priorVol = volLookup[`${priorYearPeriod}__${g.segment}__${oem.oem_name}`];
         if (priorVol != null && priorVol > 0) {
-          oem.yoy_pct =
-            Math.round(((oem.volume - priorVol) / priorVol) * 1000) / 10;
+          oem.yoy_pct = Math.round(((oem.volume - priorVol) / priorVol) * 1000) / 10;
         }
+      }
+      // MoM
+      const priorMoVol = volLookup[`${priorMo}__${g.segment}__${oem.oem_name}`];
+      if (priorMoVol != null && priorMoVol > 0) {
+        oem.mom_pct = Math.round(((oem.volume - priorMoVol) / priorMoVol) * 1000) / 10;
       }
     }
   }
 
-  const data: FADAMonthData[] = Object.values(groups).map((g) => ({
-    report_period: g.period,
-    segment: g.segment,
-    oems: g.oems,
-    total_volume: g.total,
-  }));
+  // Build monthly data with total-level YoY and MoM
+  const monthlyData: FADAMonthData[] = Object.values(groups).map((g) => {
+    const [yearStr, monthStr] = g.period.split("-");
+    const priorYearPeriod = `${Number(yearStr) - 1}-${monthStr}`;
+    const priorMo = priorMonth(g.period);
+    const priorYearTotal = totalLookup[`${priorYearPeriod}__${g.segment}`];
+    const priorMoTotal = totalLookup[`${priorMo}__${g.segment}`];
 
-  const allPeriods = [...new Set(data.map((d) => d.report_period))].sort().reverse();
-  const allSegments = [...new Set(data.map((d) => d.segment))].sort();
+    return {
+      report_period: g.period,
+      segment: g.segment,
+      oems: g.oems,
+      total_volume: g.total,
+      total_yoy_pct: priorYearTotal && priorYearTotal > 0
+        ? Math.round(((g.total - priorYearTotal) / priorYearTotal) * 1000) / 10
+        : null,
+      total_mom_pct: priorMoTotal && priorMoTotal > 0
+        ? Math.round(((g.total - priorMoTotal) / priorMoTotal) * 1000) / 10
+        : null,
+    };
+  });
+
+  // ── Build FY aggregates ──
+  const fyGroups: Record<string, {
+    fy: string; segment: string;
+    oemVolumes: Record<string, number>;
+    total: number; monthsSet: Set<string>;
+  }> = {};
+
+  for (const g of Object.values(groups)) {
+    const fy = periodToFY(g.period);
+    const fk = `${fy}__${g.segment}`;
+    if (!fyGroups[fk]) {
+      fyGroups[fk] = { fy, segment: g.segment, oemVolumes: {}, total: 0, monthsSet: new Set() };
+    }
+    fyGroups[fk].total += g.total;
+    fyGroups[fk].monthsSet.add(g.period);
+    for (const oem of g.oems) {
+      fyGroups[fk].oemVolumes[oem.oem_name] = (fyGroups[fk].oemVolumes[oem.oem_name] || 0) + oem.volume;
+    }
+  }
+
+  // Build FY OEM-level data with market share and FY YoY
+  const fyTotalLookup: Record<string, number> = {};
+  const fyOemLookup: Record<string, number> = {};
+  for (const fg of Object.values(fyGroups)) {
+    fyTotalLookup[`${fg.fy}__${fg.segment}`] = fg.total;
+    for (const [name, vol] of Object.entries(fg.oemVolumes)) {
+      fyOemLookup[`${fg.fy}__${fg.segment}__${name}`] = vol;
+    }
+  }
+
+  const fyData: FADAFYData[] = Object.values(fyGroups).map((fg) => {
+    const fyNum = parseInt(fg.fy.replace("FY", ""));
+    const priorFY = `FY${String(fyNum - 1).padStart(2, "0")}`;
+    const priorTotal = fyTotalLookup[`${priorFY}__${fg.segment}`];
+    const monthsCount = fg.monthsSet.size;
+
+    const oems: FADAFYOemRow[] = Object.entries(fg.oemVolumes)
+      .map(([name, vol]) => {
+        const priorOemVol = fyOemLookup[`${priorFY}__${fg.segment}__${name}`];
+        return {
+          oem_name: name,
+          volume: vol,
+          market_share_pct: fg.total > 0 ? Math.round((vol / fg.total) * 1000) / 10 : 0,
+          yoy_pct: priorOemVol && priorOemVol > 0
+            ? Math.round(((vol - priorOemVol) / priorOemVol) * 1000) / 10
+            : null,
+        };
+      })
+      .sort((a, b) => b.volume - a.volume);
+
+    return {
+      fy: fg.fy,
+      segment: fg.segment,
+      oems,
+      total_volume: fg.total,
+      months_count: monthsCount,
+      avg_monthly: monthsCount > 0 ? Math.round(fg.total / monthsCount) : 0,
+      total_yoy_pct: priorTotal && priorTotal > 0
+        ? Math.round(((fg.total - priorTotal) / priorTotal) * 1000) / 10
+        : null,
+    };
+  });
+
+  // ── Collect metadata ──
+  const allPeriods = [...new Set(monthlyData.map((d) => d.report_period))].sort().reverse();
+  const allSegments = [...new Set(monthlyData.map((d) => d.segment))].sort();
+  const allFYs = [...new Set(fyData.map((d) => d.fy))].sort().reverse();
 
   return {
     segments: allSegments,
     availableMonths: allPeriods,
+    availableFYs: allFYs,
     latestMonth: allPeriods[0] || "",
-    data,
+    latestFY: allFYs[0] || "",
+    monthlyData,
+    fyData,
   };
 }

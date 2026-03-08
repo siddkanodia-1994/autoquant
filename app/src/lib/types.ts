@@ -176,6 +176,7 @@ export interface FADAOemRow {
   volume: number;
   market_share_pct: number;
   yoy_pct: number | null;
+  mom_pct: number | null;
 }
 
 export interface FADAMonthData {
@@ -183,11 +184,33 @@ export interface FADAMonthData {
   segment: string;       // 2W | CV | PV
   oems: FADAOemRow[];
   total_volume: number;
+  total_yoy_pct: number | null;
+  total_mom_pct: number | null;
+}
+
+export interface FADAFYOemRow {
+  oem_name: string;
+  volume: number;
+  market_share_pct: number;
+  yoy_pct: number | null;
+}
+
+export interface FADAFYData {
+  fy: string;            // e.g. "FY25"
+  segment: string;
+  oems: FADAFYOemRow[];
+  total_volume: number;
+  months_count: number;
+  avg_monthly: number;
+  total_yoy_pct: number | null;
 }
 
 export interface FADADashboardData {
   segments: string[];
   availableMonths: string[];
+  availableFYs: string[];
   latestMonth: string;
-  data: FADAMonthData[];
+  latestFY: string;
+  monthlyData: FADAMonthData[];
+  fyData: FADAFYData[];
 }
