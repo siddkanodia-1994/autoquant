@@ -597,13 +597,15 @@ function priorMonth(period: string): string {
  * market share, YoY growth, and MoM growth.
  */
 export async function fetchFADAData(): Promise<FADADashboardData> {
+  // Fetch all rows (default Supabase limit is 1000, we have ~2000 rows)
   const { data: rawRows, error } = await supabase
     .from("raw_fada_report")
     .select("report_period, oem_name, segment, volume, yoy_pct")
     .eq("data_type", "actual")
     .order("report_period", { ascending: false })
     .order("segment")
-    .order("volume", { ascending: false });
+    .order("volume", { ascending: false })
+    .limit(5000);
 
   if (error) {
     console.error("[FADA] Query error:", error);
