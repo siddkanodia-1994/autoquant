@@ -5,12 +5,18 @@
 import { NextResponse } from "next/server";
 import { fetchFADAData } from "@/lib/queries";
 
-export const revalidate = 3600;
+// Force dynamic to avoid build cache reusing stale pre-rendered data.
+// CDN-level caching via Cache-Control handles performance.
+export const dynamic = "force-dynamic";
 
 export async function GET() {
   try {
     const data = await fetchFADAData();
-    return NextResponse.json(data);
+    return NextResponse.json(data, {
+      headers: {
+        "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+      },
+    });
   } catch (error) {
     console.error("[API] /api/fada error:", error);
     return NextResponse.json(
