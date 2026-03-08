@@ -597,22 +597,38 @@ function priorMonth(period: string): string {
  * market share, YoY growth, and MoM growth.
  */
 export async function fetchFADAData(): Promise<FADADashboardData> {
-  // Fetch all rows (default Supabase limit is 1000, we have ~2000 rows)
-  const { data: rawRows, error } = await supabase
-    .from("raw_fada_report")
-    .select("report_period, oem_name, segment, volume, yoy_pct")
-    .eq("data_type", "actual")
-    .order("report_period", { ascending: false })
-    .order("segment")
-    .order("volume", { ascending: false })
-    .limit(5000);
+  // Supabase PostgREST max-rows is 1000 by default; we have ~2000 rows.
+  // Paginate with three date-range queries to keep each batch under 1000.
+  const selectCols = "report_period, oem_name, segment, volume, yoy_pct";
+  const baseQuery = () =>
+    supabase
+      .from("raw_fada_report")
+      .select(selectCols)
+      .eq("data_type", "actual")
+      .order("report_period", { ascending: false })
+      .order("segment")
+      .order("volume", { ascending: false });
 
-  if (error) {
-    console.error("[FADA] Query error:", error);
-    throw new Error("Failed to fetch FADA data");
+  const [res1, res2, res3] = await Promise.all([
+    baseQuery().gte("report_period", "2025-06"),             // ~500 rows
+    baseQuery().gte("report_period", "2024-01").lt("report_period", "2025-06"), // ~500 rows
+    baseQuery().lt("report_period", "2024-01"),              // ~900 rows
+  ]);
+
+  for (const [i, res] of [res1, res2, res3].entries()) {
+    if (res.error) {
+      console.error(`[FADA] Query error (batch${i + 1}):`, res.error);
+      throw new Error("Failed to fetch FADA data");
+    }
   }
 
-  const rows = (rawRows || []).filter(
+  const rawRows = [
+    ...(res1.data || []),
+    ...(res2.data || []),
+    ...(res3.data || []),
+  ];
+
+  const rows = rawRows.filter(
     (r: any) => !NON_OEM_NAMES.has(r.oem_name)
   );
 
