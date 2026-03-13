@@ -597,8 +597,8 @@ function priorMonth(period: string): string {
  * market share, YoY growth, and MoM growth.
  */
 export async function fetchFADAData(): Promise<FADADashboardData> {
-  // Supabase PostgREST max-rows is 1000 by default; we have ~2000 rows.
-  // Paginate with three date-range queries to keep each batch under 1000.
+  // Supabase PostgREST max-rows is 1000 by default; we have ~2900 rows.
+  // Paginate with five date-range queries to keep each batch under 1000.
   const selectCols = "report_period, oem_name, segment, volume, yoy_pct";
   const baseQuery = () =>
     supabase
@@ -609,13 +609,15 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
       .order("segment")
       .order("volume", { ascending: false });
 
-  const [res1, res2, res3] = await Promise.all([
-    baseQuery().gte("report_period", "2025-06"),             // ~500 rows
-    baseQuery().gte("report_period", "2024-01").lt("report_period", "2025-06"), // ~500 rows
-    baseQuery().lt("report_period", "2024-01"),              // ~900 rows
+  const [res1, res2, res3, res4, res5] = await Promise.all([
+    baseQuery().gte("report_period", "2025-06"),                                    // ~430 rows
+    baseQuery().gte("report_period", "2024-06").lt("report_period", "2025-06"),     // ~550 rows
+    baseQuery().gte("report_period", "2023-06").lt("report_period", "2024-06"),     // ~540 rows
+    baseQuery().gte("report_period", "2022-06").lt("report_period", "2023-06"),     // ~660 rows
+    baseQuery().lt("report_period", "2022-06"),                                     // ~700 rows
   ]);
 
-  for (const [i, res] of [res1, res2, res3].entries()) {
+  for (const [i, res] of [res1, res2, res3, res4, res5].entries()) {
     if (res.error) {
       console.error(`[FADA] Query error (batch${i + 1}):`, res.error);
       throw new Error("Failed to fetch FADA data");
@@ -626,6 +628,8 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
     ...(res1.data || []),
     ...(res2.data || []),
     ...(res3.data || []),
+    ...(res4.data || []),
+    ...(res5.data || []),
   ];
 
   const rows = rawRows.filter(
