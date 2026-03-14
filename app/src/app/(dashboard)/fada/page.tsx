@@ -239,6 +239,7 @@ export default function FADAPage() {
         topGainer,
         topLoser: topLoser && topLoser.yoy_pct != null && topLoser.yoy_pct < 0 ? topLoser : null,
         avgMonthly: null as number | null,
+        avgMonthlyYoY: null as number | null,
         monthsCount: null as number | null,
       };
     } else if (viewMode === "fy" && currentFYData) {
@@ -258,6 +259,7 @@ export default function FADAPage() {
         topGainer,
         topLoser: topLoser && topLoser.yoy_pct != null && topLoser.yoy_pct < 0 ? topLoser : null,
         avgMonthly: fd.avg_monthly,
+        avgMonthlyYoY: fd.avg_monthly_yoy_pct,
         monthsCount: fd.months_count,
       };
     }
@@ -386,6 +388,7 @@ export default function FADAPage() {
               <KPICard
                 title="Avg Monthly Volume"
                 value={kpiData.avgMonthly ?? 0}
+                yoy={kpiData.avgMonthlyYoY ?? undefined}
                 subtitle={`${selectedFY} average`}
               />
             )}

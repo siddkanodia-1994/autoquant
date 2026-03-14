@@ -202,6 +202,7 @@ export interface FADAFYData {
   total_volume: number;
   months_count: number;
   avg_monthly: number;
+  avg_monthly_yoy_pct: number | null;
   total_yoy_pct: number | null;
 }
 

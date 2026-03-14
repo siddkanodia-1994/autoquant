@@ -743,8 +743,11 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
   // Build FY OEM-level data with market share and FY YoY
   const fyTotalLookup: Record<string, number> = {};
   const fyOemLookup: Record<string, number> = {};
+  const fyAvgMonthlyLookup: Record<string, number> = {};
   for (const fg of Object.values(fyGroups)) {
     fyTotalLookup[`${fg.fy}__${fg.segment}`] = fg.total;
+    const mc = fg.monthsSet.size;
+    fyAvgMonthlyLookup[`${fg.fy}__${fg.segment}`] = mc > 0 ? Math.round(fg.total / mc) : 0;
     for (const [name, vol] of Object.entries(fg.oemVolumes)) {
       fyOemLookup[`${fg.fy}__${fg.segment}__${name}`] = vol;
     }
@@ -777,6 +780,13 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
       total_volume: fg.total,
       months_count: monthsCount,
       avg_monthly: monthsCount > 0 ? Math.round(fg.total / monthsCount) : 0,
+      avg_monthly_yoy_pct: (() => {
+        const curAvg = monthsCount > 0 ? fg.total / monthsCount : 0;
+        const priorAvg = fyAvgMonthlyLookup[`${priorFY}__${fg.segment}`];
+        return priorAvg && priorAvg > 0
+          ? Math.round(((curAvg - priorAvg) / priorAvg) * 1000) / 10
+          : null;
+      })(),
       total_yoy_pct: priorTotal && priorTotal > 0
         ? Math.round(((fg.total - priorTotal) / priorTotal) * 1000) / 10
         : null,
