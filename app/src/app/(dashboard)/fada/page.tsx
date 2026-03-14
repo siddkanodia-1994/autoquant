@@ -294,7 +294,7 @@ export default function FADAPage() {
         <div className="flex items-start gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 dark:border-blue-900 dark:bg-blue-950/30">
           <Info className="mt-0.5 h-4 w-4 shrink-0 text-blue-500" />
           <div className="text-sm text-blue-800 dark:text-blue-300">
-            <span className="font-semibold">Historical Data:</span> FADA retail registration data from May 2021 to Feb 2026 across {data.segments.length} segments.
+            <span className="font-semibold">Historical Data:</span> FADA retail registration data from April 2021 to Feb 2026 across {data.segments.length} segments.
             Indian Financial Year (FY) runs April to March — e.g., FY25 = Apr 2024 – Mar 2025.
           </div>
         </div>
@@ -655,7 +655,7 @@ export default function FADAPage() {
         <p className="text-center text-xs text-zinc-400">
           Source: Federation of Automobile Dealers Associations (FADA), in
           collaboration with Ministry of Road Transport &amp; Highways. Data
-          reflects vehicle retail registrations at RTOs. Historical data: May 2021 — Feb 2026.
+          reflects vehicle retail registrations at RTOs. Historical data: April 2021 — Feb 2026.
         </p>
       </div>
     </div>
