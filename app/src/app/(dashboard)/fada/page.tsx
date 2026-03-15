@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo, useRef } from "react";
+import React, { useEffect, useState, useMemo, useRef } from "react";
 import { Header } from "@/components/layout/header";
 import { KPICard } from "@/components/ui/kpi-card";
 import { LoadingSpinner } from "@/components/ui/loading";
@@ -17,7 +17,7 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
   LineChart, Line, CartesianGrid,
 } from "recharts";
-import { Info, ChevronDown } from "lucide-react";
+import { Info, ChevronDown, ChevronRight } from "lucide-react";
 
 // ── Constants ──
 
@@ -77,6 +77,17 @@ export default function FADAPage() {
   const [selectedOEMs, setSelectedOEMs] = useState<string[]>([]);
   const [trendMetric, setTrendMetric] = useState<TrendMetric>("volume");
   const [trendGranularity, setTrendGranularity] = useState<TrendGranularity>("monthly");
+
+  // Group expansion state
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const toggleGroup = (groupName: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupName)) next.delete(groupName);
+      else next.add(groupName);
+      return next;
+    });
+  };
 
   // Fetch data
   useEffect(() => {
@@ -606,31 +617,80 @@ export default function FADAPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedOems.map((oem, idx) => (
-                    <tr
-                      key={oem.oem_name}
-                      className="border-b border-zinc-100 dark:border-zinc-800/50"
-                    >
-                      <td className="py-2.5 pl-1 text-zinc-400 font-mono text-xs">{idx + 1}</td>
-                      <td className="py-2.5 font-medium text-zinc-900 dark:text-zinc-100">
-                        {oem.oem_name}
-                      </td>
-                      <td className="py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
-                        {oem.volume.toLocaleString("en-IN")}
-                      </td>
-                      <td className="py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
-                        {oem.market_share_pct.toFixed(1)}%
-                      </td>
-                      <td className="py-2.5 text-right">
-                        <GrowthBadge value={oem.yoy_pct} />
-                      </td>
-                      {viewMode === "monthly" && (
-                        <td className="py-2.5 text-right">
-                          <GrowthBadge value={"mom_pct" in oem ? (oem as any).mom_pct : null} />
-                        </td>
-                      )}
-                    </tr>
-                  ))}
+                  {sortedOems.map((oem, idx) => {
+                    const isGroup = !!(oem as any).is_group;
+                    const children = (oem as any).children as typeof sortedOems | undefined;
+                    const isExpanded = expandedGroups.has(oem.oem_name);
+
+                    return (
+                      <React.Fragment key={oem.oem_name}>
+                        <tr
+                          className={cn(
+                            "border-b border-zinc-100 dark:border-zinc-800/50",
+                            isGroup && "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                          )}
+                          onClick={isGroup ? () => toggleGroup(oem.oem_name) : undefined}
+                        >
+                          <td className="py-2.5 pl-1 text-zinc-400 font-mono text-xs">{idx + 1}</td>
+                          <td className="py-2.5 font-medium text-zinc-900 dark:text-zinc-100">
+                            <span className="flex items-center gap-1.5">
+                              {isGroup && (
+                                <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center text-zinc-400">
+                                  {isExpanded ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                                </span>
+                              )}
+                              {oem.oem_name}
+                              {isGroup && children && (
+                                <span className="ml-1 rounded-full bg-zinc-100 px-1.5 py-0.5 text-[10px] font-normal text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+                                  {children.length} sub
+                                </span>
+                              )}
+                            </span>
+                          </td>
+                          <td className="py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
+                            {oem.volume.toLocaleString("en-IN")}
+                          </td>
+                          <td className="py-2.5 text-right font-mono text-zinc-700 dark:text-zinc-300">
+                            {oem.market_share_pct.toFixed(1)}%
+                          </td>
+                          <td className="py-2.5 text-right">
+                            <GrowthBadge value={oem.yoy_pct} />
+                          </td>
+                          {viewMode === "monthly" && (
+                            <td className="py-2.5 text-right">
+                              <GrowthBadge value={"mom_pct" in oem ? (oem as any).mom_pct : null} />
+                            </td>
+                          )}
+                        </tr>
+                        {/* Expanded children rows */}
+                        {isGroup && isExpanded && children?.map((child) => (
+                          <tr
+                            key={`${oem.oem_name}__${child.oem_name}`}
+                            className="border-b border-zinc-50 bg-zinc-50/50 dark:border-zinc-800/30 dark:bg-zinc-900/30"
+                          >
+                            <td className="py-2 pl-1"></td>
+                            <td className="py-2 pl-7 text-sm text-zinc-600 dark:text-zinc-400">
+                              {child.oem_name}
+                            </td>
+                            <td className="py-2 text-right font-mono text-xs text-zinc-500 dark:text-zinc-400">
+                              {child.volume.toLocaleString("en-IN")}
+                            </td>
+                            <td className="py-2 text-right font-mono text-xs text-zinc-500 dark:text-zinc-400">
+                              {child.market_share_pct.toFixed(1)}%
+                            </td>
+                            <td className="py-2 text-right">
+                              <GrowthBadge value={child.yoy_pct} />
+                            </td>
+                            {viewMode === "monthly" && (
+                              <td className="py-2 text-right">
+                                <GrowthBadge value={"mom_pct" in child ? (child as any).mom_pct : null} />
+                              </td>
+                            )}
+                          </tr>
+                        ))}
+                      </React.Fragment>
+                    );
+                  })}
                   {/* Total Row */}
                   <tr className="font-semibold">
                     <td className="pt-3"></td>

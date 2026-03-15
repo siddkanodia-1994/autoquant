@@ -571,11 +571,166 @@ export async function fetchHistoricalData(): Promise<HistoricalData> {
 
 // ── FADA Retail Data Queries ──
 
-/** Non-OEM entries to filter out (fuel type aggregates / catch-all buckets) */
+/** Non-OEM entries to filter out (fuel type aggregates) */
 const NON_OEM_NAMES = new Set([
   "DIESEL", "EV", "PETROL/ETHANOL", "CNG/LPG", "HYBRID",
-  "METHANOL", "OTHERS", "OTHERS INCLUDING EV",
+  "METHANOL", "OTHERS INCLUDING EV",
 ]);
+
+/**
+ * OEM Group Consolidation Maps.
+ *
+ * FADA data contains both group-level totals (e.g. "SKODA AUTO VOLKSWAGEN GROUP")
+ * and subsidiary-level rows (e.g. "SKODA AUTO VOLKSWAGEN INDIA PVT LTD", "AUDI AG").
+ * The subsidiary volumes are ALREADY included in the group total, so we must:
+ *   1. Keep the group row as the main entry (its volume IS the consolidated total)
+ *   2. Attach subsidiary rows as children for drill-down
+ *   3. Remove subsidiary rows from the top-level list to avoid double-counting
+ *
+ * When only subsidiaries exist (no group row for that period), we sum them into
+ * a synthetic group entry.
+ */
+
+/** Maps a group display name → array of subsidiary OEM names */
+const OEM_GROUP_MAP: Record<string, { groupNames: string[]; subsidiaries: string[] }> = {
+  "SKODA AUTO VOLKSWAGEN GROUP": {
+    groupNames: ["SKODA AUTO VOLKSWAGEN GROUP"],
+    subsidiaries: [
+      "SKODA AUTO VOLKSWAGEN INDIA PVT LTD",
+      "AUDI AG",
+      "VOLKSWAGEN AG/INDIA PVT. LTD.",
+      "PORSCHE AG GERMANY",
+      "AUTOMOBILI LAMBORGHINI S.P.A",
+      "SKODA AUTO INDIA/AS PVT LTD",
+    ],
+  },
+  "MERCEDES-BENZ GROUP": {
+    groupNames: ["MERCEDES -BENZ GROUP", "MERCEDES BENZ"],
+    subsidiaries: [
+      "MERCEDES-BENZ INDIA PVT LTD",
+      "MERCEDES -BENZ AG",
+      "DAIMLER AG",
+    ],
+  },
+  "STELLANTIS GROUP": {
+    groupNames: ["STELLANTIS GROUP"],
+    subsidiaries: [
+      "STELLANTIS AUTOMOBILES INDIA PVT LTD",
+      "STELLANTIS INDIA PVT LTD",
+      "PCA AUTOMOBILES INDIA PVT LTD",
+      "PCA AUTOMOBILI INDIA PVT LTD",
+      "FIAT INDIA AUTOMOBILES PVT LTD",
+    ],
+  },
+  "BAJAJ AUTO GROUP": {
+    groupNames: ["BAJAJ AUTO GROUP"],
+    subsidiaries: [
+      "BAJAJ AUTO LTD",
+      "BAJAJ AUTO",
+      "CHETAK TECHNOLOGY LIMITED",
+    ],
+  },
+  "MAHINDRA GROUP": {
+    groupNames: [], // No dedicated group row; M&M acts as group
+    subsidiaries: [
+      "MAHINDRA LAST MILE MOBILITY LTD",
+    ],
+  },
+};
+
+/** Reverse lookup: subsidiary name → canonical group name */
+const SUBSIDIARY_TO_GROUP: Record<string, string> = {};
+/** Group-level OEM names (the row that already contains the consolidated total) */
+const GROUP_ROW_NAMES = new Set<string>();
+
+for (const [canonicalGroup, config] of Object.entries(OEM_GROUP_MAP)) {
+  for (const sub of config.subsidiaries) {
+    SUBSIDIARY_TO_GROUP[sub] = canonicalGroup;
+  }
+  for (const gn of config.groupNames) {
+    SUBSIDIARY_TO_GROUP[gn] = canonicalGroup;
+    GROUP_ROW_NAMES.add(gn);
+  }
+}
+
+/** Special case: MAHINDRA & MAHINDRA LIMITED acts as the group parent for CV segment */
+const MAHINDRA_PARENT = "MAHINDRA & MAHINDRA LIMITED";
+
+/**
+ * Consolidates OEM rows into groups.
+ * - Group rows keep their volume (which already includes subsidiaries).
+ * - Subsidiary rows become children of the group.
+ * - If no group row exists for a period but subsidiaries do, we sum them.
+ */
+function consolidateOEMRows<T extends { oem_name: string; volume: number }>(
+  oems: T[],
+  segment: string,
+): T[] {
+  // Identify which OEMs belong to groups
+  const groupBuckets: Record<string, { groupRow: T | null; children: T[] }> = {};
+  const standalone: T[] = [];
+
+  for (const oem of oems) {
+    // Special Mahindra logic: only consolidate in CV segment
+    if (segment === "CV" && oem.oem_name === "MAHINDRA LAST MILE MOBILITY LTD") {
+      const groupName = "MAHINDRA GROUP";
+      if (!groupBuckets[groupName]) groupBuckets[groupName] = { groupRow: null, children: [] };
+      groupBuckets[groupName].children.push(oem);
+      continue;
+    }
+    if (segment === "CV" && oem.oem_name === MAHINDRA_PARENT) {
+      const groupName = "MAHINDRA GROUP";
+      if (!groupBuckets[groupName]) groupBuckets[groupName] = { groupRow: null, children: [] };
+      // M&M is the parent — treat it as both group row and a child for display
+      groupBuckets[groupName].groupRow = oem;
+      groupBuckets[groupName].children.push(oem);
+      continue;
+    }
+
+    const canonicalGroup = SUBSIDIARY_TO_GROUP[oem.oem_name];
+    if (canonicalGroup) {
+      if (!groupBuckets[canonicalGroup]) groupBuckets[canonicalGroup] = { groupRow: null, children: [] };
+      if (GROUP_ROW_NAMES.has(oem.oem_name)) {
+        groupBuckets[canonicalGroup].groupRow = oem;
+      } else {
+        groupBuckets[canonicalGroup].children.push(oem);
+      }
+    } else {
+      standalone.push(oem);
+    }
+  }
+
+  // Build consolidated list
+  const result: T[] = [...standalone];
+
+  for (const [canonicalGroup, bucket] of Object.entries(groupBuckets)) {
+    if (bucket.groupRow) {
+      // Group row exists — use its volume (already consolidated), attach children
+      const groupEntry = {
+        ...bucket.groupRow,
+        oem_name: canonicalGroup,
+        is_group: true,
+        children: bucket.children.length > 0
+          ? bucket.children.sort((a, b) => b.volume - a.volume)
+          : undefined,
+      };
+      result.push(groupEntry);
+    } else if (bucket.children.length > 0) {
+      // No group row — sum subsidiaries into a synthetic group
+      const totalVol = bucket.children.reduce((sum, c) => sum + c.volume, 0);
+      const syntheticGroup = {
+        ...bucket.children[0], // Copy shape from first child
+        oem_name: canonicalGroup,
+        volume: totalVol,
+        is_group: true,
+        children: bucket.children.sort((a, b) => b.volume - a.volume),
+      };
+      result.push(syntheticGroup);
+    }
+  }
+
+  return result;
+}
 
 /** Convert YYYY-MM period to Indian Financial Year label */
 function periodToFY(period: string): string {
@@ -659,10 +814,20 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
     });
   }
 
-  // Compute market share
+  // Consolidate OEM groups and recompute totals + market share
   for (const g of Object.values(groups)) {
+    const consolidated = consolidateOEMRows(g.oems, g.segment);
+    // Recalculate total from consolidated (non-double-counted) rows
+    g.total = consolidated.reduce((sum, o) => sum + o.volume, 0);
+    g.oems = consolidated;
     for (const oem of g.oems) {
       oem.market_share_pct = g.total > 0 ? Math.round((oem.volume / g.total) * 1000) / 10 : 0;
+      // Recompute market share for children too
+      if (oem.children) {
+        for (const child of oem.children) {
+          child.market_share_pct = g.total > 0 ? Math.round((child.volume / g.total) * 1000) / 10 : 0;
+        }
+      }
     }
   }
 
@@ -721,22 +886,38 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
   });
 
   // ── Build FY aggregates ──
+  // Track group→children structure from monthly consolidated data
+  const fyGroupChildren: Record<string, Record<string, Record<string, number>>> = {};
+  // key: fyKey → groupName → childName → volume
+
   const fyGroups: Record<string, {
     fy: string; segment: string;
     oemVolumes: Record<string, number>;
     total: number; monthsSet: Set<string>;
+    groupNames: Set<string>;
   }> = {};
 
   for (const g of Object.values(groups)) {
     const fy = periodToFY(g.period);
     const fk = `${fy}__${g.segment}`;
     if (!fyGroups[fk]) {
-      fyGroups[fk] = { fy, segment: g.segment, oemVolumes: {}, total: 0, monthsSet: new Set() };
+      fyGroups[fk] = { fy, segment: g.segment, oemVolumes: {}, total: 0, monthsSet: new Set(), groupNames: new Set() };
+      fyGroupChildren[fk] = {};
     }
     fyGroups[fk].total += g.total;
     fyGroups[fk].monthsSet.add(g.period);
     for (const oem of g.oems) {
       fyGroups[fk].oemVolumes[oem.oem_name] = (fyGroups[fk].oemVolumes[oem.oem_name] || 0) + oem.volume;
+      if (oem.is_group) {
+        fyGroups[fk].groupNames.add(oem.oem_name);
+        if (oem.children) {
+          if (!fyGroupChildren[fk][oem.oem_name]) fyGroupChildren[fk][oem.oem_name] = {};
+          for (const child of oem.children) {
+            fyGroupChildren[fk][oem.oem_name][child.oem_name] =
+              (fyGroupChildren[fk][oem.oem_name][child.oem_name] || 0) + child.volume;
+          }
+        }
+      }
     }
   }
 
@@ -759,9 +940,28 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
     const priorTotal = fyTotalLookup[`${priorFY}__${fg.segment}`];
     const monthsCount = fg.monthsSet.size;
 
+    const fk = `${fg.fy}__${fg.segment}`;
+    // OEMs are already consolidated at the monthly level; compute market share + YoY + group info
     const oems: FADAFYOemRow[] = Object.entries(fg.oemVolumes)
       .map(([name, vol]) => {
         const priorOemVol = fyOemLookup[`${priorFY}__${fg.segment}__${name}`];
+        const isGroup = fg.groupNames.has(name);
+        const childMap = fyGroupChildren[fk]?.[name];
+        const children: FADAFYOemRow[] | undefined = isGroup && childMap
+          ? Object.entries(childMap)
+              .map(([childName, childVol]) => {
+                const priorChildVol = fyOemLookup[`${priorFY}__${fg.segment}__${childName}`];
+                return {
+                  oem_name: childName,
+                  volume: childVol,
+                  market_share_pct: fg.total > 0 ? Math.round((childVol / fg.total) * 1000) / 10 : 0,
+                  yoy_pct: priorChildVol && priorChildVol > 0
+                    ? Math.round(((childVol - priorChildVol) / priorChildVol) * 1000) / 10
+                    : null,
+                };
+              })
+              .sort((a, b) => b.volume - a.volume)
+          : undefined;
         return {
           oem_name: name,
           volume: vol,
@@ -769,6 +969,7 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
           yoy_pct: priorOemVol && priorOemVol > 0
             ? Math.round(((vol - priorOemVol) / priorOemVol) * 1000) / 10
             : null,
+          ...(isGroup ? { is_group: true, children } : {}),
         };
       })
       .sort((a, b) => b.volume - a.volume);

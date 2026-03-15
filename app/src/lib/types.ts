@@ -177,6 +177,8 @@ export interface FADAOemRow {
   market_share_pct: number;
   yoy_pct: number | null;
   mom_pct: number | null;
+  is_group?: boolean;
+  children?: FADAOemRow[];
 }
 
 export interface FADAMonthData {
@@ -193,6 +195,8 @@ export interface FADAFYOemRow {
   volume: number;
   market_share_pct: number;
   yoy_pct: number | null;
+  is_group?: boolean;
+  children?: FADAFYOemRow[];
 }
 
 export interface FADAFYData {
