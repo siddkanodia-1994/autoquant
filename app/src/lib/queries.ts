@@ -691,7 +691,16 @@ function consolidateOEMRows<T extends { oem_name: string; volume: number }>(
     if (canonicalGroup) {
       if (!groupBuckets[canonicalGroup]) groupBuckets[canonicalGroup] = { groupRow: null, children: [] };
       if (GROUP_ROW_NAMES.has(oem.oem_name)) {
-        groupBuckets[canonicalGroup].groupRow = oem;
+        // Multiple group-level names may exist (e.g. "MERCEDES -BENZ GROUP" + "MERCEDES BENZ").
+        // Keep the one with the highest volume as the group row; demote the other to a child.
+        if (!groupBuckets[canonicalGroup].groupRow || oem.volume > groupBuckets[canonicalGroup].groupRow.volume) {
+          if (groupBuckets[canonicalGroup].groupRow) {
+            groupBuckets[canonicalGroup].children.push(groupBuckets[canonicalGroup].groupRow);
+          }
+          groupBuckets[canonicalGroup].groupRow = oem;
+        } else {
+          groupBuckets[canonicalGroup].children.push(oem);
+        }
       } else {
         groupBuckets[canonicalGroup].children.push(oem);
       }
