@@ -671,18 +671,12 @@ function consolidateOEMRows<T extends { oem_name: string; volume: number }>(
   const standalone: T[] = [];
 
   for (const oem of oems) {
-    // Special Mahindra logic: only consolidate in CV segment
-    if (segment === "CV" && oem.oem_name === "MAHINDRA LAST MILE MOBILITY LTD") {
+    // Special Mahindra logic: only consolidate in CV segment.
+    // M&M's volume does NOT include MAHINDRA LAST MILE, so we sum them
+    // (unlike other groups where the group row already contains the total).
+    if (segment === "CV" && (oem.oem_name === "MAHINDRA LAST MILE MOBILITY LTD" || oem.oem_name === MAHINDRA_PARENT)) {
       const groupName = "MAHINDRA GROUP";
       if (!groupBuckets[groupName]) groupBuckets[groupName] = { groupRow: null, children: [] };
-      groupBuckets[groupName].children.push(oem);
-      continue;
-    }
-    if (segment === "CV" && oem.oem_name === MAHINDRA_PARENT) {
-      const groupName = "MAHINDRA GROUP";
-      if (!groupBuckets[groupName]) groupBuckets[groupName] = { groupRow: null, children: [] };
-      // M&M is the parent — treat it as both group row and a child for display
-      groupBuckets[groupName].groupRow = oem;
       groupBuckets[groupName].children.push(oem);
       continue;
     }
