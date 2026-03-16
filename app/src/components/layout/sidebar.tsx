@@ -4,11 +4,6 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   BarChart3,
-  Building2,
-  LayoutDashboard,
-  TrendingUp,
-  Table2,
-  Clock,
   Car,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -16,14 +11,9 @@ import { cn } from "@/lib/utils";
 const navItems: {
   href: string;
   label: string;
-  icon: typeof LayoutDashboard;
+  icon: typeof Car;
   disabled?: boolean;
 }[] = [
-  { href: "/dashboard", label: "Industry Pulse", icon: LayoutDashboard },
-  { href: "/oem", label: "OEM Deep Dive", icon: Building2 },
-  { href: "/scorecard", label: "Scorecard", icon: Table2 },
-  { href: "/revenue", label: "Revenue Proxy", icon: TrendingUp },
-  { href: "/history", label: "Historical", icon: Clock },
   { href: "/fada", label: "FADA Retail", icon: Car },
 ];
 
