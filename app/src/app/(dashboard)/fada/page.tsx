@@ -12,6 +12,8 @@ import type {
   FADAOemRow,
   FADAFYData,
   FADAFYOemRow,
+  FADAQuarterData,
+  FADAQuarterOemRow,
 } from "@/lib/types";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
@@ -33,9 +35,9 @@ const OEM_COLORS = [
   "#14b8a6", "#e11d48", "#a855f7", "#0ea5e9", "#d97706",
 ];
 
-type ViewMode = "monthly" | "fy";
+type ViewMode = "monthly" | "quarterly" | "fy";
 type TrendMetric = "volume" | "yoy";
-type TrendGranularity = "monthly" | "yearly";
+type TrendGranularity = "monthly" | "quarterly" | "yearly";
 
 // ── Helpers ──
 
@@ -57,6 +59,10 @@ function shortOEM(name: string): string {
     .trim();
 }
 
+function quarterSortKey(q: string): number {
+  return parseInt(q.slice(4)) * 4 + (parseInt(q[1]) - 1);
+}
+
 // ── Main Page ──
 
 export default function FADAPage() {
@@ -69,6 +75,7 @@ export default function FADAPage() {
   const [viewMode, setViewMode] = useState<ViewMode>("monthly");
   const [selectedMonth, setSelectedMonth] = useState<string>("");
   const [selectedFY, setSelectedFY] = useState<string>("");
+  const [selectedQuarter, setSelectedQuarter] = useState<string>("");
 
   // Table sort
   const [sortBy, setSortBy] = useState<"volume" | "yoy" | "share">("volume");
@@ -100,6 +107,7 @@ export default function FADAPage() {
         setData(d);
         setSelectedMonth(d.latestMonth);
         setSelectedFY(d.latestFY);
+        setSelectedQuarter(d.latestQuarter);
         if (d.segments.includes("PV")) setSelectedSegment("PV");
         else if (d.segments.length > 0) setSelectedSegment(d.segments[0]);
       })
@@ -138,6 +146,20 @@ export default function FADAPage() {
     );
   }, [data, selectedFY, selectedSegment]);
 
+  const currentQuarterData = useMemo(() => {
+    if (!data) return null;
+    return data.quarterlyData.find(
+      (d) => d.quarter === selectedQuarter && d.segment === selectedSegment
+    );
+  }, [data, selectedQuarter, selectedSegment]);
+
+  // Reset trend granularity when view mode changes
+  useEffect(() => {
+    if (viewMode === "monthly") setTrendGranularity("monthly");
+    else if (viewMode === "quarterly") setTrendGranularity("quarterly");
+    else setTrendGranularity("yearly");
+  }, [viewMode]);
+
   // All OEMs in current segment (for multi-select)
   const allOEMsInSegment = useMemo(() => {
     if (!data) return [];
@@ -159,6 +181,8 @@ export default function FADAPage() {
   const sortedOems = useMemo(() => {
     const oems = viewMode === "monthly"
       ? [...(currentMonthData?.oems || [])]
+      : viewMode === "quarterly"
+      ? (currentQuarterData?.oems || []).map((o) => ({ ...o, mom_pct: null as number | null }))
       : (currentFYData?.oems || []).map((o) => ({ ...o, mom_pct: null as number | null }));
     switch (sortBy) {
       case "volume": return oems.sort((a, b) => b.volume - a.volume);
@@ -166,11 +190,15 @@ export default function FADAPage() {
       case "share": return oems.sort((a, b) => b.market_share_pct - a.market_share_pct);
       default: return oems;
     }
-  }, [currentMonthData, currentFYData, sortBy, viewMode]);
+  }, [currentMonthData, currentFYData, currentQuarterData, sortBy, viewMode]);
 
   // Bar chart data (top 10)
   const chartData = useMemo(() => {
-    const oems = viewMode === "monthly" ? currentMonthData?.oems : currentFYData?.oems;
+    const oems = viewMode === "monthly"
+      ? currentMonthData?.oems
+      : viewMode === "quarterly"
+      ? currentQuarterData?.oems
+      : currentFYData?.oems;
     if (!oems) return [];
     return [...oems]
       .sort((a, b) => b.volume - a.volume)
@@ -182,7 +210,7 @@ export default function FADAPage() {
         share: oem.market_share_pct,
         yoy: oem.yoy_pct,
       }));
-  }, [currentMonthData, currentFYData, viewMode]);
+  }, [currentMonthData, currentFYData, currentQuarterData, viewMode]);
 
   // ── Line Chart Data ──
   const trendData = useMemo(() => {
@@ -202,6 +230,26 @@ export default function FADAPage() {
         const point: Record<string, any> = { period, label: monthLabel(period) };
         for (const oem of selectedOEMs) {
           const oemRow = md?.oems.find((o) => o.oem_name === oem);
+          point[oem] = trendMetric === "volume"
+            ? (oemRow?.volume ?? null)
+            : (oemRow?.yoy_pct ?? null);
+        }
+        return point;
+      });
+    } else if (trendGranularity === "quarterly") {
+      const quarters = data.quarterlyData
+        .filter((d) => d.segment === selectedSegment)
+        .map((d) => d.quarter)
+        .filter((v, i, a) => a.indexOf(v) === i)
+        .sort((a, b) => quarterSortKey(a) - quarterSortKey(b));
+
+      return quarters.map((quarter) => {
+        const qd = data.quarterlyData.find(
+          (d) => d.quarter === quarter && d.segment === selectedSegment
+        );
+        const point: Record<string, any> = { period: quarter, label: quarter };
+        for (const oem of selectedOEMs) {
+          const oemRow = qd?.oems.find((o) => o.oem_name === oem);
           point[oem] = trendMetric === "volume"
             ? (oemRow?.volume ?? null)
             : (oemRow?.yoy_pct ?? null);
@@ -253,6 +301,26 @@ export default function FADAPage() {
         avgMonthlyYoY: null as number | null,
         monthsCount: null as number | null,
       };
+    } else if (viewMode === "quarterly" && currentQuarterData) {
+      const qd = currentQuarterData;
+      const nonOthers = qd.oems.filter((o) => o.yoy_pct != null);
+      const topGainer = nonOthers.length > 0
+        ? nonOthers.reduce((a, b) => ((a.yoy_pct ?? -Infinity) > (b.yoy_pct ?? -Infinity) ? a : b))
+        : null;
+      const topLoser = nonOthers.length > 0
+        ? nonOthers.reduce((a, b) => ((a.yoy_pct ?? Infinity) < (b.yoy_pct ?? Infinity) ? a : b))
+        : null;
+      return {
+        totalVol: qd.total_volume,
+        totalYoY: qd.total_yoy_pct,
+        totalMoM: qd.total_qoq_pct,
+        oemCount: qd.oems.length,
+        topGainer,
+        topLoser: topLoser && topLoser.yoy_pct != null && topLoser.yoy_pct < 0 ? topLoser : null,
+        avgMonthly: null as number | null,
+        avgMonthlyYoY: null as number | null,
+        monthsCount: qd.months_count,
+      };
     } else if (viewMode === "fy" && currentFYData) {
       const fd = currentFYData;
       const nonOthers = fd.oems.filter((o) => o.yoy_pct != null);
@@ -275,7 +343,7 @@ export default function FADAPage() {
       };
     }
     return null;
-  }, [viewMode, currentMonthData, currentFYData]);
+  }, [viewMode, currentMonthData, currentFYData, currentQuarterData]);
 
   // ── Render ──
   if (loading) return <LoadingSpinner className="h-screen" />;
@@ -292,7 +360,11 @@ export default function FADAPage() {
   if (!data) return null;
 
   const segMeta = SEGMENT_META[selectedSegment] || { label: selectedSegment, color: "#6366f1" };
-  const periodLabel = viewMode === "monthly" ? monthLabel(selectedMonth) : selectedFY;
+  const periodLabel = viewMode === "monthly"
+    ? monthLabel(selectedMonth)
+    : viewMode === "quarterly"
+    ? selectedQuarter
+    : selectedFY;
 
   return (
     <div>
@@ -336,7 +408,7 @@ export default function FADAPage() {
 
           {/* View Toggle */}
           <div className="flex gap-1 rounded-lg bg-zinc-100 p-1 dark:bg-zinc-900">
-            {(["monthly", "fy"] as const).map((mode) => (
+            {(["monthly", "quarterly", "fy"] as const).map((mode) => (
               <button
                 key={mode}
                 onClick={() => setViewMode(mode)}
@@ -347,7 +419,7 @@ export default function FADAPage() {
                     : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
                 )}
               >
-                {mode === "monthly" ? "Monthly" : "Financial Year"}
+                {mode === "monthly" ? "Monthly" : mode === "quarterly" ? "Quarterly" : "Financial Year"}
               </button>
             ))}
           </div>
@@ -361,6 +433,18 @@ export default function FADAPage() {
             >
               {data.availableMonths.map((m) => (
                 <option key={m} value={m}>{monthLabel(m)}</option>
+              ))}
+            </select>
+          ) : viewMode === "quarterly" ? (
+            <select
+              value={selectedQuarter}
+              onChange={(e) => setSelectedQuarter(e.target.value)}
+              className="rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-700 shadow-sm dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+            >
+              {data.availableQuarters.map((q) => (
+                <option key={q} value={q}>
+                  {q}{q === data.latestQuarter ? " (Partial)" : ""}
+                </option>
               ))}
             </select>
           ) : (
@@ -385,13 +469,19 @@ export default function FADAPage() {
               title={`${segMeta.label} — Total`}
               value={kpiData.totalVol}
               yoy={kpiData.totalYoY ?? undefined}
-              subtitle={viewMode === "fy" && kpiData.monthsCount
+              subtitle={viewMode !== "monthly" && kpiData.monthsCount
                 ? `${kpiData.monthsCount} months of data`
                 : undefined}
             />
             {viewMode === "monthly" ? (
               <KPICard
                 title="MoM Change"
+                value={kpiData.totalMoM != null ? `${kpiData.totalMoM > 0 ? "+" : ""}${kpiData.totalMoM.toFixed(1)}%` : "\u2014"}
+                subtitle={periodLabel}
+              />
+            ) : viewMode === "quarterly" ? (
+              <KPICard
+                title="QoQ Change"
                 value={kpiData.totalMoM != null ? `${kpiData.totalMoM > 0 ? "+" : ""}${kpiData.totalMoM.toFixed(1)}%` : "\u2014"}
                 subtitle={periodLabel}
               />
@@ -471,7 +561,7 @@ export default function FADAPage() {
 
               {/* Granularity Toggle */}
               <div className="flex gap-1 rounded-lg bg-zinc-100 p-0.5 dark:bg-zinc-800">
-                {(["monthly", "yearly"] as const).map((g) => (
+                {(["monthly", "quarterly", "yearly"] as const).map((g) => (
                   <button
                     key={g}
                     onClick={() => setTrendGranularity(g)}
@@ -482,7 +572,7 @@ export default function FADAPage() {
                         : "text-zinc-500 hover:text-zinc-700 dark:text-zinc-400"
                     )}
                   >
-                    {g === "monthly" ? "Monthly" : "Yearly (FY)"}
+                    {g === "monthly" ? "Monthly" : g === "quarterly" ? "Quarterly" : "Yearly (FY)"}
                   </button>
                 ))}
               </div>
@@ -515,7 +605,7 @@ export default function FADAPage() {
                     <XAxis
                       dataKey="label"
                       tick={{ fontSize: 10, fill: "#71717a" }}
-                      interval={trendGranularity === "monthly" ? Math.max(0, Math.floor(trendData.length / 12)) : 0}
+                      interval={trendGranularity === "monthly" ? Math.max(0, Math.floor(trendData.length / 12)) : trendGranularity === "quarterly" ? Math.max(0, Math.floor(trendData.length / 8)) : 0}
                       angle={-30}
                       textAnchor="end"
                       height={50}
@@ -696,7 +786,12 @@ export default function FADAPage() {
                     <td className="pt-3"></td>
                     <td className="pt-3 text-zinc-900 dark:text-zinc-100">TOTAL</td>
                     <td className="pt-3 text-right font-mono text-zinc-900 dark:text-zinc-100">
-                      {(viewMode === "monthly" ? currentMonthData?.total_volume : currentFYData?.total_volume)?.toLocaleString("en-IN") ?? "\u2014"}
+                      {(viewMode === "monthly"
+                        ? currentMonthData?.total_volume
+                        : viewMode === "quarterly"
+                        ? currentQuarterData?.total_volume
+                        : currentFYData?.total_volume
+                      )?.toLocaleString("en-IN") ?? "\u2014"}
                     </td>
                     <td className="pt-3 text-right font-mono text-zinc-900 dark:text-zinc-100">100.0%</td>
                     <td className="pt-3 text-right">

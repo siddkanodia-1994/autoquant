@@ -210,12 +210,34 @@ export interface FADAFYData {
   total_yoy_pct: number | null;
 }
 
+export interface FADAQuarterOemRow {
+  oem_name: string;
+  volume: number;
+  market_share_pct: number;
+  yoy_pct: number | null;   // vs same quarter prior year
+  is_group?: boolean;
+  children?: FADAQuarterOemRow[];
+}
+
+export interface FADAQuarterData {
+  quarter: string;            // e.g. "Q1FY25"
+  segment: string;
+  oems: FADAQuarterOemRow[];
+  total_volume: number;
+  months_count: number;       // typically 3; <3 for partial current quarter
+  total_yoy_pct: number | null;
+  total_qoq_pct: number | null;
+}
+
 export interface FADADashboardData {
   segments: string[];
   availableMonths: string[];
   availableFYs: string[];
+  availableQuarters: string[];
   latestMonth: string;
   latestFY: string;
+  latestQuarter: string;
   monthlyData: FADAMonthData[];
   fyData: FADAFYData[];
+  quarterlyData: FADAQuarterData[];
 }

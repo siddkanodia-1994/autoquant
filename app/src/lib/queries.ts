@@ -22,6 +22,8 @@ import type {
   FADAOemRow,
   FADAFYData,
   FADAFYOemRow,
+  FADAQuarterData,
+  FADAQuarterOemRow,
 } from "./types";
 
 // ── Industry Pulse Queries ──
@@ -749,6 +751,31 @@ function priorMonth(period: string): string {
   return `${y}-${String(m - 1).padStart(2, "0")}`;
 }
 
+/** Convert YYYY-MM period to Indian FY quarter label: "2024-04" → "Q1FY25" */
+function periodToQuarter(period: string): string {
+  const [, m] = period.split("-").map(Number);
+  const qNum = m >= 4 && m <= 6 ? 1 : m >= 7 && m <= 9 ? 2 : m >= 10 ? 3 : 4;
+  return `Q${qNum}${periodToFY(period)}`;
+}
+
+/** Monotonically increasing sort key for quarter labels: "Q2FY25" → 101 */
+function quarterSortKey(q: string): number {
+  return parseInt(q.slice(4)) * 4 + (parseInt(q[1]) - 1);
+}
+
+/** Prior quarter: "Q1FY25" → "Q4FY24", "Q3FY25" → "Q2FY25" */
+function priorQuarter(q: string): string {
+  const qNum = parseInt(q[1]);
+  const fyNum = parseInt(q.slice(4));
+  if (qNum === 1) return `Q4FY${String(fyNum - 1).padStart(2, "0")}`;
+  return `Q${qNum - 1}FY${String(fyNum).padStart(2, "0")}`;
+}
+
+/** Same quarter prior year: "Q2FY25" → "Q2FY24" */
+function priorYearQuarter(q: string): string {
+  return `Q${q[1]}FY${String(parseInt(q.slice(4)) - 1).padStart(2, "0")}`;
+}
+
 /**
  * Fetch FADA monthly OEM retail data across all segments.
  * Returns monthly + FY grouped data with OEM-level detail,
@@ -997,18 +1024,119 @@ export async function fetchFADAData(): Promise<FADADashboardData> {
     };
   });
 
+  // ── Build Quarterly aggregates ──
+  const qGroupChildren: Record<string, Record<string, Record<string, number>>> = {};
+  const qGroups: Record<string, {
+    quarter: string; segment: string;
+    oemVolumes: Record<string, number>;
+    total: number; monthsSet: Set<string>;
+    groupNames: Set<string>;
+  }> = {};
+
+  for (const g of Object.values(groups)) {
+    const quarter = periodToQuarter(g.period);
+    const qk = `${quarter}__${g.segment}`;
+    if (!qGroups[qk]) {
+      qGroups[qk] = { quarter, segment: g.segment, oemVolumes: {}, total: 0, monthsSet: new Set(), groupNames: new Set() };
+      qGroupChildren[qk] = {};
+    }
+    qGroups[qk].total += g.total;
+    qGroups[qk].monthsSet.add(g.period);
+    for (const oem of g.oems) {
+      qGroups[qk].oemVolumes[oem.oem_name] = (qGroups[qk].oemVolumes[oem.oem_name] || 0) + oem.volume;
+      if (oem.is_group) {
+        qGroups[qk].groupNames.add(oem.oem_name);
+        if (oem.children) {
+          if (!qGroupChildren[qk][oem.oem_name]) qGroupChildren[qk][oem.oem_name] = {};
+          for (const child of oem.children) {
+            qGroupChildren[qk][oem.oem_name][child.oem_name] =
+              (qGroupChildren[qk][oem.oem_name][child.oem_name] || 0) + child.volume;
+          }
+        }
+      }
+    }
+  }
+
+  const qTotalLookup: Record<string, number> = {};
+  const qOemLookup: Record<string, number> = {};
+  for (const qg of Object.values(qGroups)) {
+    qTotalLookup[`${qg.quarter}__${qg.segment}`] = qg.total;
+    for (const [name, vol] of Object.entries(qg.oemVolumes)) {
+      qOemLookup[`${qg.quarter}__${qg.segment}__${name}`] = vol;
+    }
+  }
+
+  const quarterlyData: FADAQuarterData[] = Object.values(qGroups).map((qg) => {
+    const pYQ = priorYearQuarter(qg.quarter);
+    const pQ = priorQuarter(qg.quarter);
+    const priorYearTotal = qTotalLookup[`${pYQ}__${qg.segment}`];
+    const priorQTotal = qTotalLookup[`${pQ}__${qg.segment}`];
+
+    const qk = `${qg.quarter}__${qg.segment}`;
+    const oems: FADAQuarterOemRow[] = Object.entries(qg.oemVolumes)
+      .map(([name, vol]) => {
+        const priorOemVol = qOemLookup[`${pYQ}__${qg.segment}__${name}`];
+        const isGroup = qg.groupNames.has(name);
+        const childMap = qGroupChildren[qk]?.[name];
+        const children: FADAQuarterOemRow[] | undefined = isGroup && childMap
+          ? Object.entries(childMap)
+              .map(([childName, childVol]) => {
+                const priorChildVol = qOemLookup[`${pYQ}__${qg.segment}__${childName}`];
+                return {
+                  oem_name: childName,
+                  volume: childVol,
+                  market_share_pct: qg.total > 0 ? Math.round((childVol / qg.total) * 1000) / 10 : 0,
+                  yoy_pct: priorChildVol && priorChildVol > 0
+                    ? Math.round(((childVol - priorChildVol) / priorChildVol) * 1000) / 10
+                    : null,
+                };
+              })
+              .sort((a, b) => b.volume - a.volume)
+          : undefined;
+        return {
+          oem_name: name,
+          volume: vol,
+          market_share_pct: qg.total > 0 ? Math.round((vol / qg.total) * 1000) / 10 : 0,
+          yoy_pct: priorOemVol && priorOemVol > 0
+            ? Math.round(((vol - priorOemVol) / priorOemVol) * 1000) / 10
+            : null,
+          ...(isGroup ? { is_group: true, children } : {}),
+        };
+      })
+      .sort((a, b) => b.volume - a.volume);
+
+    return {
+      quarter: qg.quarter,
+      segment: qg.segment,
+      oems,
+      total_volume: qg.total,
+      months_count: qg.monthsSet.size,
+      total_yoy_pct: priorYearTotal && priorYearTotal > 0
+        ? Math.round(((qg.total - priorYearTotal) / priorYearTotal) * 1000) / 10
+        : null,
+      total_qoq_pct: priorQTotal && priorQTotal > 0
+        ? Math.round(((qg.total - priorQTotal) / priorQTotal) * 1000) / 10
+        : null,
+    };
+  }).sort((a, b) => quarterSortKey(b.quarter) - quarterSortKey(a.quarter));
+
   // ── Collect metadata ──
   const allPeriods = [...new Set(monthlyData.map((d) => d.report_period))].sort().reverse();
   const allSegments = [...new Set(monthlyData.map((d) => d.segment))].sort();
   const allFYs = [...new Set(fyData.map((d) => d.fy))].sort().reverse();
+  const allQuarters = [...new Set(quarterlyData.map((d) => d.quarter))]
+    .sort((a, b) => quarterSortKey(b) - quarterSortKey(a));
 
   return {
     segments: allSegments,
     availableMonths: allPeriods,
     availableFYs: allFYs,
+    availableQuarters: allQuarters,
     latestMonth: allPeriods[0] || "",
     latestFY: allFYs[0] || "",
+    latestQuarter: allQuarters[0] || "",
     monthlyData,
     fyData,
+    quarterlyData,
   };
 }
